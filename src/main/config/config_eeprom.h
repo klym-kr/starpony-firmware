@@ -30,8 +30,13 @@ bool isEEPROMStructureValid(void);
 bool loadEEPROM(void);
 void writeConfigToEEPROM(void);
 
+struct pgRegistry_s;
 uint16_t getEEPROMConfigSize(void);
 size_t getEEPROMStorageSize(void);
+bool isPgDirty(const struct pgRegistry_s *reg);
+uint16_t getDirtyPgCount(void);
+uint32_t getLastEepromWriteDurationMs(void);
+uint32_t getEepromWriteCount(void);
 
 bool saveEEPROMToSDCard(void);
 void saveEEPROMToMemoryMappedFlash(void);

@@ -432,6 +432,32 @@ typedef struct afatfsFile_t {
 } afatfsFile_t;
 
 typedef enum {
+    AFATFS_FORMAT_REGION_RESERVED = 0,
+    AFATFS_FORMAT_REGION_FAT1,
+    AFATFS_FORMAT_REGION_FAT2,
+    AFATFS_FORMAT_REGION_ROOT_CLUSTER,
+    AFATFS_FORMAT_REGION_MBR
+} afatfsFormatRegion_e;
+
+typedef struct afatfsFormatState_t {
+    uint32_t partitionStartSector;
+    uint32_t reservedSectors;
+    uint32_t fatStartSector;
+    uint32_t fatSectors;
+    uint32_t sectorsPerCluster;
+    uint32_t numClusters;
+    uint32_t clusterStartSector;
+    uint32_t totalPartitionSectors;
+    uint32_t regionOffset;
+    uint32_t volumeSerial;
+    afatfsFormatRegion_e region;
+    uint8_t retries;
+    bool writeInFlight;
+    bool writeFailed;
+    bool writePendingAdvance;
+} afatfsFormatState_t;
+
+typedef enum {
     AFATFS_INITIALIZATION_READ_MBR,
     AFATFS_INITIALIZATION_READ_VOLUME_ID,
 
@@ -449,7 +475,9 @@ typedef enum {
     AFATFS_INITIALIZATION_INTROSPEC_LOG_CREATING,
 #endif
 
-    AFATFS_INITIALIZATION_DONE
+    AFATFS_INITIALIZATION_DONE,
+    AFATFS_INITIALIZATION_FORMAT_WAIT_IDLE,
+    AFATFS_INITIALIZATION_FORMAT_WRITE_SECTORS
 } afatfsInitializationPhase_e;
 
 typedef struct afatfs_t {
@@ -458,13 +486,14 @@ typedef struct afatfs_t {
     afatfsFilesystemState_e filesystemState;
     afatfsInitializationPhase_e initPhase;
 
-    // State used during FS initialisation where only one member of the union is used at a time
-#ifdef AFATFS_USE_FREEFILE
+    // State used during FS initialisation / formatting where only one member of the union is used at a time
     union {
+#ifdef AFATFS_USE_FREEFILE
         afatfsFreeSpaceSearch_t freeSpaceSearch;
         afatfsFreeSpaceFAT_t freeSpaceFAT;
-    } initState;
 #endif
+        afatfsFormatState_t format;
+    } initState;
 
 #if ENABLE_AFATFS_DMA_CACHE
     uint8_t *cache;
@@ -3438,6 +3467,213 @@ static void afatfs_introspecLogCreated(afatfsFile_t *file)
 
 #endif
 
+static void afatfs_writeU32LE(uint8_t *dst, uint32_t value)
+{
+    dst[0] = (uint8_t)(value & 0xFFU);
+    dst[1] = (uint8_t)((value >> 8) & 0xFFU);
+    dst[2] = (uint8_t)((value >> 16) & 0xFFU);
+    dst[3] = (uint8_t)((value >> 24) & 0xFFU);
+}
+
+static void afatfs_formatWriteComplete(sdcardBlockOperation_e operation, uint32_t sectorIndex, uint8_t *buffer, uint32_t callbackData)
+{
+    UNUSED(operation);
+    UNUSED(sectorIndex);
+    UNUSED(callbackData);
+
+    if (afatfs.filesystemState == AFATFS_FILESYSTEM_STATE_INITIALIZATION
+        && afatfs.initPhase == AFATFS_INITIALIZATION_FORMAT_WRITE_SECTORS) {
+        afatfs.initState.format.writeInFlight = false;
+        if (buffer == NULL) {
+            afatfs.initState.format.writeFailed = true;
+        }
+    }
+}
+
+static bool afatfs_formatAdvance(afatfsFormatState_t *fmt)
+{
+    fmt->regionOffset++;
+
+    switch (fmt->region) {
+        case AFATFS_FORMAT_REGION_RESERVED:
+            if (fmt->regionOffset >= 32U) {
+                fmt->region = AFATFS_FORMAT_REGION_FAT1;
+                fmt->regionOffset = 0U;
+            }
+            return true;
+
+        case AFATFS_FORMAT_REGION_FAT1:
+            if (fmt->regionOffset >= fmt->fatSectors) {
+                fmt->region = AFATFS_FORMAT_REGION_FAT2;
+                fmt->regionOffset = 0U;
+            }
+            return true;
+
+        case AFATFS_FORMAT_REGION_FAT2:
+            if (fmt->regionOffset >= fmt->fatSectors) {
+                fmt->region = AFATFS_FORMAT_REGION_ROOT_CLUSTER;
+                fmt->regionOffset = 0U;
+            }
+            return true;
+
+        case AFATFS_FORMAT_REGION_ROOT_CLUSTER:
+            if (fmt->regionOffset >= fmt->sectorsPerCluster) {
+                fmt->region = AFATFS_FORMAT_REGION_MBR;
+                fmt->regionOffset = 0U;
+            }
+            return true;
+
+        case AFATFS_FORMAT_REGION_MBR:
+        default:
+            return false;
+    }
+}
+
+static uint32_t afatfs_formatPrepareSector(const afatfsFormatState_t *fmt, uint8_t *buf)
+{
+    memset(buf, 0, AFATFS_SECTOR_SIZE);
+
+    switch (fmt->region) {
+        case AFATFS_FORMAT_REGION_RESERVED: {
+            if (fmt->regionOffset == 0U || fmt->regionOffset == 6U) {
+                fatVolumeID_t *vol = (fatVolumeID_t *)buf;
+                vol->jmpBoot[0] = 0xEB;
+                vol->jmpBoot[1] = 0x58;
+                vol->jmpBoot[2] = 0x90;
+                memcpy(vol->oemName, "MSDOS5.0", sizeof(vol->oemName));
+                vol->bytesPerSector = AFATFS_SECTOR_SIZE;
+                vol->sectorsPerCluster = (uint8_t)fmt->sectorsPerCluster;
+                vol->reservedSectorCount = (uint16_t)fmt->reservedSectors;
+                vol->numFATs = AFATFS_NUM_FATS;
+                vol->rootEntryCount = 0;
+                vol->totalSectors16 = 0;
+                vol->media = 0xF8;
+                vol->FATSize16 = 0;
+                vol->sectorsPerTrack = 63;
+                vol->numHeads = 255;
+                vol->hiddenSectors = fmt->partitionStartSector;
+                vol->totalSectors32 = fmt->totalPartitionSectors;
+
+                vol->fatDescriptor.fat32.FATSize32 = fmt->fatSectors;
+                vol->fatDescriptor.fat32.extFlags = 0;
+                vol->fatDescriptor.fat32.fsVer = 0;
+                vol->fatDescriptor.fat32.rootCluster = FAT_SMALLEST_LEGAL_CLUSTER_NUMBER;
+                vol->fatDescriptor.fat32.fsInfo = 1;
+                vol->fatDescriptor.fat32.backupBootSector = 6;
+                vol->fatDescriptor.fat32.driveNumber = 0x80;
+                vol->fatDescriptor.fat32.bootSignature = 0x29;
+                vol->fatDescriptor.fat32.volumeID = fmt->volumeSerial;
+                memcpy(vol->fatDescriptor.fat32.volumeLabel, "ST4RPONY   ", sizeof(vol->fatDescriptor.fat32.volumeLabel));
+                memcpy(vol->fatDescriptor.fat32.fileSystemType, "FAT32   ", sizeof(vol->fatDescriptor.fat32.fileSystemType));
+
+                buf[510] = FAT_VOLUME_ID_SIGNATURE_1;
+                buf[511] = FAT_VOLUME_ID_SIGNATURE_2;
+            } else if (fmt->regionOffset == 1U || fmt->regionOffset == 7U) {
+                afatfs_writeU32LE(buf + 0, 0x41615252U);
+                afatfs_writeU32LE(buf + 484, 0x61417272U);
+                afatfs_writeU32LE(buf + 488, fmt->numClusters - 1U);
+                afatfs_writeU32LE(buf + 492, 3U);
+                buf[510] = FAT_VOLUME_ID_SIGNATURE_1;
+                buf[511] = FAT_VOLUME_ID_SIGNATURE_2;
+            } else if (fmt->regionOffset == 2U || fmt->regionOffset == 8U) {
+                buf[510] = FAT_VOLUME_ID_SIGNATURE_1;
+                buf[511] = FAT_VOLUME_ID_SIGNATURE_2;
+            }
+            return fmt->partitionStartSector + fmt->regionOffset;
+        }
+
+        case AFATFS_FORMAT_REGION_FAT1:
+        case AFATFS_FORMAT_REGION_FAT2: {
+            if (fmt->regionOffset == 0U) {
+                afatfs_writeU32LE(buf + 0, 0x0FFFFFF8U);
+                afatfs_writeU32LE(buf + 4, 0x0FFFFFFFU);
+                afatfs_writeU32LE(buf + 8, 0x0FFFFFFFU);
+            }
+            const uint32_t fatBase = (fmt->region == AFATFS_FORMAT_REGION_FAT1)
+                ? fmt->fatStartSector
+                : fmt->fatStartSector + fmt->fatSectors;
+            return fatBase + fmt->regionOffset;
+        }
+
+        case AFATFS_FORMAT_REGION_ROOT_CLUSTER:
+            return fmt->clusterStartSector + fmt->regionOffset;
+
+        case AFATFS_FORMAT_REGION_MBR:
+        default: {
+            mbrPartitionEntry_t *part = (mbrPartitionEntry_t *)(buf + 446);
+            part[0].bootFlag = 0x00;
+            part[0].chsBegin[0] = 0xFE;
+            part[0].chsBegin[1] = 0xFF;
+            part[0].chsBegin[2] = 0xFF;
+            part[0].type = MBR_PARTITION_TYPE_FAT32_LBA;
+            part[0].chsEnd[0] = 0xFE;
+            part[0].chsEnd[1] = 0xFF;
+            part[0].chsEnd[2] = 0xFF;
+            part[0].lbaBegin = fmt->partitionStartSector;
+            part[0].numSectors = fmt->totalPartitionSectors;
+            buf[510] = FAT_VOLUME_ID_SIGNATURE_1;
+            buf[511] = FAT_VOLUME_ID_SIGNATURE_2;
+            return 0U;
+        }
+    }
+}
+
+static void afatfs_formatContinue(void)
+{
+    afatfsFormatState_t *fmt = &afatfs.initState.format;
+
+    if (fmt->writeInFlight) {
+        return;
+    }
+
+    if (fmt->writeFailed) {
+        fmt->writeFailed = false;
+        fmt->writePendingAdvance = false;
+        if (++fmt->retries > 8U) {
+            afatfs.lastError = AFATFS_ERROR_GENERIC;
+            afatfs.filesystemState = AFATFS_FILESYSTEM_STATE_FATAL;
+            return;
+        }
+    } else if (fmt->writePendingAdvance) {
+        fmt->writePendingAdvance = false;
+        fmt->retries = 0U;
+        if (!afatfs_formatAdvance(fmt)) {
+            memset(&afatfs.initState, 0, sizeof(afatfs.initState));
+            afatfs_init();
+            return;
+        }
+    }
+
+    uint8_t *buf = afatfs_cacheSectorGetMemory(0);
+    const uint32_t targetBlock = afatfs_formatPrepareSector(fmt, buf);
+
+    switch (sdcard_writeBlock(targetBlock, buf, afatfs_formatWriteComplete, targetBlock)) {
+        case SDCARD_OPERATION_IN_PROGRESS:
+            fmt->writeInFlight = true;
+            fmt->writePendingAdvance = true;
+            break;
+
+        case SDCARD_OPERATION_SUCCESS:
+            fmt->retries = 0U;
+            if (!afatfs_formatAdvance(fmt)) {
+                memset(&afatfs.initState, 0, sizeof(afatfs.initState));
+                afatfs_init();
+            }
+            break;
+
+        case SDCARD_OPERATION_BUSY:
+            break;
+
+        case SDCARD_OPERATION_FAILURE:
+        default:
+            if (++fmt->retries > 8U) {
+                afatfs.lastError = AFATFS_ERROR_GENERIC;
+                afatfs.filesystemState = AFATFS_FILESYSTEM_STATE_FATAL;
+            }
+            break;
+    }
+}
+
 static void afatfs_initContinue(void)
 {
 #ifdef AFATFS_USE_FREEFILE
@@ -3561,6 +3797,15 @@ static void afatfs_initContinue(void)
         case AFATFS_INITIALIZATION_DONE:
             afatfs.filesystemState = AFATFS_FILESYSTEM_STATE_READY;
         break;
+        case AFATFS_INITIALIZATION_FORMAT_WAIT_IDLE:
+            if (!sdcard_isBusy()) {
+                afatfs.initPhase = AFATFS_INITIALIZATION_FORMAT_WRITE_SECTORS;
+                goto doMore;
+            }
+        break;
+        case AFATFS_INITIALIZATION_FORMAT_WRITE_SECTORS:
+            afatfs_formatContinue();
+        break;
     }
 }
 
@@ -3639,6 +3884,88 @@ afatfsFilesystemState_e afatfs_getFilesystemState(void)
 afatfsError_e afatfs_getLastError(void)
 {
     return afatfs.lastError;
+}
+
+bool afatfs_format(void)
+{
+    if (!sdcard_isInserted() || !sdcard_isFunctional() || !sdcard_isInitialized()) {
+        return false;
+    }
+
+    if (afatfs.filesystemState == AFATFS_FILESYSTEM_STATE_INITIALIZATION
+        && afatfs.initPhase >= AFATFS_INITIALIZATION_FORMAT_WAIT_IDLE) {
+        return false;
+    }
+
+    const sdcardMetadata_t *meta = sdcard_getMetadata();
+    const uint32_t numBlocks = meta ? meta->numBlocks : 0U;
+    if (numBlocks < 131072U) {
+        return false;
+    }
+
+    const uint32_t partStart = 8192U;
+    const uint32_t totalPartSectors = numBlocks - partStart;
+
+    uint32_t spc;
+    if (totalPartSectors >= 134217728U) {
+        spc = 128U;
+    } else if (totalPartSectors >= 8388608U) {
+        spc = 64U;
+    } else if (totalPartSectors >= 4194304U) {
+        spc = 32U;
+    } else if (totalPartSectors >= 1048576U) {
+        spc = 8U;
+    } else if (totalPartSectors >= 262144U) {
+        spc = 2U;
+    } else {
+        spc = 1U;
+    }
+
+    uint32_t reservedSectors = 32U;
+    const uint32_t maxClusters = (totalPartSectors - reservedSectors) / spc;
+    const uint32_t fatSectors = (maxClusters + 2U + (AFATFS_FAT32_FAT_ENTRIES_PER_SECTOR - 1U)) / AFATFS_FAT32_FAT_ENTRIES_PER_SECTOR;
+
+    if (totalPartSectors >= 262144U) {
+        const uint32_t alignRem = (reservedSectors + 2U * fatSectors) % 8192U;
+        if (alignRem != 0U) {
+            reservedSectors += (8192U - alignRem);
+        }
+    }
+
+    const uint32_t dataOffset = reservedSectors + 2U * fatSectors;
+    if (totalPartSectors <= dataOffset) {
+        return false;
+    }
+
+    const uint32_t dataSectors = totalPartSectors - dataOffset;
+    const uint32_t numClusters = dataSectors / spc;
+    if (numClusters <= FAT16_MAX_CLUSTERS
+        || ((uint64_t)numClusters + 2ULL) > (uint64_t)fatSectors * AFATFS_FAT32_FAT_ENTRIES_PER_SECTOR) {
+        return false;
+    }
+
+    const uint32_t volumeSerial = meta->productSerial ^ 0x53543452U;
+
+    memset(&afatfs, 0, sizeof(afatfs));
+#if ENABLE_AFATFS_DMA_CACHE
+    afatfs.cache = afatfs_cache;
+#endif
+    afatfs.filesystemState = AFATFS_FILESYSTEM_STATE_INITIALIZATION;
+    afatfs.initPhase = AFATFS_INITIALIZATION_FORMAT_WAIT_IDLE;
+    afatfs.lastError = AFATFS_ERROR_NONE;
+
+    afatfs.initState.format.partitionStartSector = partStart;
+    afatfs.initState.format.reservedSectors = reservedSectors;
+    afatfs.initState.format.fatStartSector = partStart + reservedSectors;
+    afatfs.initState.format.fatSectors = fatSectors;
+    afatfs.initState.format.sectorsPerCluster = spc;
+    afatfs.initState.format.numClusters = numClusters;
+    afatfs.initState.format.clusterStartSector = partStart + dataOffset;
+    afatfs.initState.format.totalPartitionSectors = totalPartSectors;
+    afatfs.initState.format.volumeSerial = volumeSerial;
+    afatfs.initState.format.region = AFATFS_FORMAT_REGION_RESERVED;
+
+    return true;
 }
 
 void afatfs_init(void)

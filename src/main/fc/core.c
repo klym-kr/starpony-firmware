@@ -78,6 +78,7 @@
 #endif
 
 #include "flight/imu.h"
+#include "flight/ladrc.h"
 #include "flight/mixer.h"
 #include "flight/pid.h"
 #include "flight/position.h"
@@ -85,6 +86,7 @@
 #include "flight/servos.h"
 
 #include "io/beeper.h"
+#include "io/companion_link.h"
 #include "io/gps.h"
 #include "io/pidaudio.h"
 #include "io/serial.h"
@@ -551,6 +553,7 @@ void disarm(flightLogDisarmReason_e reason)
 #ifdef USE_DSHOT
         setMotorSpinDirection(DSHOT_CMD_SPIN_DIRECTION_NORMAL);
 #endif
+        mixerResetDisarmedMotors();
 
         // make disarming beeps, but not if ARMING_DISABLED (RUNAWAY_TAKEOFF or CRASH_DETECTED)
         if (!(getArmingDisableFlags() & (ARMING_DISABLED_RUNAWAY_TAKEOFF | ARMING_DISABLED_CRASH_DETECTED))) {
@@ -624,6 +627,7 @@ if (isMotorProtocolDshot()) {
 #ifdef USE_RPM_LIMIT
         mixerResetRpmLimiter();
 #endif
+        mixerResetDisarmedMotors();
         ENABLE_ARMING_FLAG(ARMED);  // ***ARM NOW ***
 
 #ifdef USE_RC_STATS
@@ -844,8 +848,20 @@ bool processRx(timeUs_t currentTimeUs)
     const bool launchControlActive = isLaunchControlActive();
     static bool isAirmodeActive;
 
+#ifdef USE_COMPANION_LINK
+    const bool companionThrottleActive = (companionLinkIsOffboardActive() && (companionLinkGetSetpoint()->target[3] > 0.03f))
+        || (companionLinkIsLevelHoldActive() && (companionLinkGetFailsafeThrottle() > 0.03f))
+        || companionLinkShouldTriggerRth();
+    const bool companionAutonomousActive = companionLinkIsOffboardActive()
+        || companionLinkIsLevelHoldActive()
+        || companionLinkShouldTriggerRth();
+#else
+    const bool companionThrottleActive = false;
+    const bool companionAutonomousActive = false;
+#endif
+
     if (ARMING_FLAG(ARMED)) {
-        if (throttlePercent >= rxConfig()->airModeActivateThreshold) {
+        if (throttlePercent >= rxConfig()->airModeActivateThreshold || companionThrottleActive) {
             throttleRaised = true; // Latch true until disarm
         }
         if (isAirmodeEnabled() && !launchControlActive) {
@@ -858,12 +874,12 @@ bool processRx(timeUs_t currentTimeUs)
 
     // Note: If Airmode is enabled, on arming, iTerm and PIDs will be off until throttle exceeds the threshold (OFF while disarmed)
     // If not, iTerm will be off at low throttle, with pidStabilisationState determining whether PIDs will be active
-    if (ARMING_FLAG(ARMED) && (isAirmodeActive || throttleActive || launchControlActive || isFixedWing())) {
+    if (ARMING_FLAG(ARMED) && (isAirmodeActive || throttleActive || launchControlActive || isFixedWing() || companionThrottleActive)) {
         pidSetItermReset(false);
         pidStabilisationState(PID_STABILISATION_ON);
     } else {
         pidSetItermReset(true);
-        pidStabilisationState(currentPidProfile->pidAtMinThrottle ? PID_STABILISATION_ON : PID_STABILISATION_OFF);
+        pidStabilisationState((currentPidProfile->pidAtMinThrottle || companionAutonomousActive) ? PID_STABILISATION_ON : PID_STABILISATION_OFF);
     }
 
 #ifdef USE_RUNAWAY_TAKEOFF
@@ -968,6 +984,14 @@ void processRxModes(timeUs_t currentTimeUs)
 #endif
     const throttleStatus_e throttleStatus = calculateThrottleStatus();
 
+#ifdef USE_COMPANION_LINK
+    const bool companionAutonomousForDisarm = companionLinkIsOffboardActive()
+        || companionLinkIsLevelHoldActive()
+        || companionLinkShouldTriggerRth();
+#else
+    const bool companionAutonomousForDisarm = false;
+#endif
+
     // When armed and motors aren't spinning, do beeps and then disarm
     // board after delay so users without buzzer won't lose fingers.
     // mixTable constrains motor commands, so checking  throttleStatus is enough
@@ -977,6 +1001,7 @@ void processRxModes(timeUs_t currentTimeUs)
         && !isFixedWing()
         && !featureIsEnabled(FEATURE_3D)
         && !isAirmodeEnabled()
+        && !companionAutonomousForDisarm
         && !FLIGHT_MODE(GPS_RESCUE_MODE)  // disable auto-disarm when GPS Rescue is active
         && !flightPlanNavIsRescuePlanActive()  // ... or a plan rescue / fallback descent is flying
         && !flightPlanNavIsRescueDescentActive()
@@ -1039,9 +1064,24 @@ void processRxModes(timeUs_t currentTimeUs)
         processRcAdjustments(currentControlRateProfile);
     }
 
+#ifdef USE_COMPANION_LINK
+    const bool companionRthActive = companionLinkShouldTriggerRth();
+    const bool companionRequestsAngle = companionLinkIsLevelHoldActive()
+        || (companionLinkIsOffboardActive() && (companionLinkGetSetpoint()->mode == COMPANION_MODE_ATTITUDE_THRUST))
+#if !defined(USE_GPS_RESCUE) || ENABLE_RESCUE_PLAN
+        || companionRthActive
+#endif
+        ;
+#else
+    const bool companionRthActive = false;
+    const bool companionRequestsAngle = false;
+#endif
+    UNUSED(companionRthActive);
+
     bool canUseHorizonMode = true;
     if ((IS_RC_MODE_ACTIVE(BOXANGLE)
         || failsafeIsActive()
+        || companionRequestsAngle
 #ifdef USE_ALTITUDE_HOLD
         || FLIGHT_MODE(ALT_HOLD_MODE)
 #endif
@@ -1064,6 +1104,7 @@ void processRxModes(timeUs_t currentTimeUs)
     // GPS_RESCUE_MODE controller. (With ENABLE_RESCUE_PLAN both are flown as an
     // autopilot rescue mission instead - staged below and in failsafe.c.)
     if (ARMING_FLAG(ARMED) && (IS_RC_MODE_ACTIVE(BOXGPSRESCUE)
+        || companionRthActive
         || (failsafeIsActive() && failsafeConfig()->failsafe_procedure == FAILSAFE_PROCEDURE_GPS_RESCUE))) {
         if (!FLIGHT_MODE(GPS_RESCUE_MODE)) {
             ENABLE_FLIGHT_MODE(GPS_RESCUE_MODE);
@@ -1101,7 +1142,8 @@ void processRxModes(timeUs_t currentTimeUs)
     bool rescueDescentRequest = false;
     static bool rescueSwitchStaged = false;
     static bool rescueSwitchDescending = false;
-    if (ARMING_FLAG(ARMED) && IS_RC_MODE_ACTIVE(BOXGPSRESCUE) && !failsafeIsActive()) {
+    const bool rescueRequested = IS_RC_MODE_ACTIVE(BOXGPSRESCUE) || companionRthActive;
+    if (ARMING_FLAG(ARMED) && rescueRequested && !failsafeIsActive()) {
         if (!rescueSwitchStaged) {
             rescueSwitchStaged = flightPlanNavStageRescuePlan();
         }
@@ -1310,7 +1352,41 @@ static FAST_CODE_NOINLINE void subTaskPidController(timeUs_t currentTimeUs)
 {
     uint32_t startTime = 0;
     if (debugMode == DEBUG_PIDLOOP) {startTime = micros();}
-    // PID - note this is function pointer set by setPIDController()
+    float vbatRatio = 1.0f;
+    if (isBatteryVoltageConfigured() && getBatteryCellCount() > 0) {
+#if defined(USE_BATTERY_VOLTAGE_SAG_COMPENSATION)
+        const uint16_t cellV = getBatterySagCellVoltage();
+#else
+        const uint16_t cellV = getBatteryAverageCellVoltage();
+#endif
+        if (cellV > 250) {
+            vbatRatio = (float)cellV / 380.0f;
+        }
+    }
+    const uint8_t profileIndex = getCurrentPidProfileIndex();
+    const float sagComp = RPM_LIMIT_ACTIVE ? 0.0f : constrainf((float)currentPidProfile->vbat_sag_compensation / 100.0f, 0.0f, 1.0f);
+    // Avoid double-compensating battery voltage alongside Betaflight's vbat_sag_compensation mixer scaling
+    const float effectiveVbatRatio = 1.0f + (vbatRatio - 1.0f) * (1.0f - sagComp);
+    float airspeedCms = 0.0f;
+    if (ARMING_FLAG(ARMED) && isFixedWing()) {
+#ifdef USE_WING
+        airspeedCms = pidGetWingAirspeedCms();
+#endif
+#ifdef USE_GPS
+        if (airspeedCms <= 100.0f && STATE(GPS_FIX)) {
+            airspeedCms = (float)MAX(gpsSol.speed3d, gpsSol.groundSpeed);
+        }
+#endif
+    }
+    ladrcSetExternalB0Scale(ladrcComputeB0Scale(ladrcProfiles(profileIndex), effectiveVbatRatio, airspeedCms, isFixedWing()));
+    if (ARMING_FLAG(ARMED)) {
+        const float gyroPeak = fmaxf(fabsf(gyro.gyroADCf[FD_ROLL]), fmaxf(fabsf(gyro.gyroADCf[FD_PITCH]), fabsf(gyro.gyroADCf[FD_YAW])));
+        ladrcUpdateLiftoffState(mixerGetThrottle(), gyroPeak, targetPidLooptime * 1e-6f);
+    } else {
+        ladrcResetState();
+        ladrcSetAirborne(false);
+    }
+    // Primary ADRC/LADRC flight controller
     pidController(currentPidProfile, currentTimeUs);
     DEBUG_SET(DEBUG_PIDLOOP, 1, micros() - startTime);
 
@@ -1413,6 +1489,7 @@ static FAST_CODE void subTaskMotorUpdate(timeUs_t currentTimeUs)
     }
 
     mixTable(currentTimeUs);
+    ladrcPostMixerUpdate(mixerGetAuthorityScale(), pidIsStabilisationEnabled());
 
 #ifdef USE_SERVOS
     // motor outputs are used as sources for servo mixing, so motors must be calculated using mixTable() before servos.
@@ -1456,6 +1533,16 @@ static FAST_CODE_NOINLINE void subTaskRcCommand(timeUs_t currentTimeUs)
     }
 
     processRcCommand();
+#ifdef USE_COMPANION_LINK
+    const bool overrideSwitchOrFailsafe = failsafeIsActive()
+        || isCrashFlipModeActive()
+        || (isModeActivationConditionPresent(BOXMSPOVERRIDE) && !IS_RC_MODE_ACTIVE(BOXMSPOVERRIDE));
+    const bool stickOverride = (getRcDeflectionAbs(FD_ROLL) > 0.08f)
+        || (getRcDeflectionAbs(FD_PITCH) > 0.08f)
+        || (getRcDeflectionAbs(FD_YAW) > 0.08f);
+    companionLinkSetPilotOverride(overrideSwitchOrFailsafe, stickOverride);
+    companionLinkUpdate(currentTimeUs);
+#endif
 }
 
 FAST_CODE void taskGyroSample(timeUs_t currentTimeUs)

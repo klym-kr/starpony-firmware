@@ -20,6 +20,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "platform.h"
 
@@ -84,6 +85,13 @@ static void sdcard_deselect(void)
     spiRelease(&sdcard.dev);
 }
 
+static void sdcard_recordError(uint8_t stage, uint8_t token, uint32_t blockIndex)
+{
+    sdcard.diag.lastErrorStage = stage;
+    sdcard.diag.lastErrorToken = token;
+    sdcard.diag.lastErrorBlock = blockIndex;
+}
+
 /**
  * Handle a failure of an SD card operation by resetting the card back to its initialization phase.
  *
@@ -98,6 +106,7 @@ static void sdcard_reset(void)
     }
 
     if (sdcard.state >= SDCARD_STATE_READY) {
+        sdcard.writeErrorCount++;
         spiSetClkDivisor(&sdcard.dev, spiCalculateDivider(SDCARD_MAX_SPI_INIT_CLK_HZ));
     }
 
@@ -398,7 +407,7 @@ static sdcardReceiveBlockStatus_e sdcard_receiveDataBlock(uint8_t *buffer, int c
     }
 }
 
-static bool sdcard_sendDataBlockFinish(void)
+static bool sdcard_sendDataBlockFinish(uint8_t *tokenOut)
 {
     uint16_t dummyCRC = 0;
     uint8_t dataResponseToken;
@@ -414,6 +423,10 @@ static bool sdcard_sendDataBlockFinish(void)
 
     // Block pending completion of SPI access
     spiWait(&sdcard.dev);
+
+    if (tokenOut) {
+        *tokenOut = dataResponseToken;
+    }
 
     /*
      * Check if the card accepted the write (no CRC error / no address error)
@@ -450,7 +463,12 @@ static void sdcard_sendDataBlockBegin(uint8_t *buffer, bool multiBlockWrite)
         };
 
     segments[2].u.buffers.txData = buffer;
-    segments[2].len = spiUseDMA(&sdcard.dev) ? SDCARD_BLOCK_SIZE : SDCARD_NON_DMA_CHUNK_SIZE;
+#ifdef USE_DMA
+    const bool useTxDma = spiUseSDO_DMA(&sdcard.dev);
+#else
+    const bool useTxDma = false;
+#endif
+    segments[2].len = useTxDma ? SDCARD_BLOCK_SIZE : SDCARD_NON_DMA_CHUNK_SIZE;
 
     spiSequence(&sdcard.dev, &segments[0]);
 
@@ -599,6 +617,8 @@ static void sdcardSpi_init(const sdcardConfig_t *config, const spiPinConfig_t *s
     sdcard.operationStartTime = millis();
     sdcard.state = SDCARD_STATE_RESET;
     sdcard.failureCount = 0;
+    sdcard.writeErrorCount = 0;
+    memset(&sdcard.diag, 0, sizeof(sdcard.diag));
 }
 
 static bool sdcard_setBlockLength(uint32_t blockLen)
@@ -755,12 +775,25 @@ static bool sdcardSpi_poll(void)
             } // else keep waiting for the CID to arrive
         break;
         case SDCARD_STATE_SENDING_WRITE:
-            // Have we finished sending the write yet?
+            // Wait for any active chunk/DMA transfer to finish before pushing the next chunk or CRC.
             sendComplete = !spiIsBusy(&sdcard.dev);
+            if (!sendComplete) {
+                break;
+            }
 
-            if (!spiUseDMA(&sdcard.dev)) {
-                // Send another chunk
-                spiReadWriteBuf(&sdcard.dev, sdcard.pendingOperation.buffer + SDCARD_NON_DMA_CHUNK_SIZE * sdcard.pendingOperation.chunkIndex, NULL, SDCARD_NON_DMA_CHUNK_SIZE);
+#ifdef USE_DMA
+            if (!spiUseSDO_DMA(&sdcard.dev)) {
+#else
+            {
+#endif
+                // Keep CS asserted between non-DMA write chunks so the card receives a contiguous 512B block before CRC.
+                static busSegment_t chunkSegments[] = {
+                    {.u.buffers = {NULL, NULL}, SDCARD_NON_DMA_CHUNK_SIZE, false, NULL},
+                    {.u.link = {NULL, NULL}, 0, true, NULL},
+                };
+                chunkSegments[0].u.buffers.txData = sdcard.pendingOperation.buffer + SDCARD_NON_DMA_CHUNK_SIZE * sdcard.pendingOperation.chunkIndex;
+                spiSequence(&sdcard.dev, &chunkSegments[0]);
+                spiWait(&sdcard.dev);
 
                 sdcard.pendingOperation.chunkIndex++;
 
@@ -768,8 +801,10 @@ static bool sdcardSpi_poll(void)
             }
 
             if (sendComplete) {
+                uint8_t dataRespToken = 0;
                 // Finish up by sending the CRC and checking the SD-card's acceptance/rejectance
-                if (sdcard_sendDataBlockFinish()) {
+                if (sdcard_sendDataBlockFinish(&dataRespToken)) {
+                    sdcard.diag.writeAccepted++;
                     // The SD card is now busy committing that write to the card
                     sdcard.state = SDCARD_STATE_WAITING_FOR_WRITE;
                     sdcard.operationStartTime = millis();
@@ -782,6 +817,8 @@ static bool sdcardSpi_poll(void)
                     /* Our write was rejected! This could be due to a bad address but we hope not to attempt that, so assume
                      * the card is broken and needs reset.
                      */
+                    sdcard.diag.writeRejected++;
+                    sdcard_recordError(2, dataRespToken, sdcard.pendingOperation.blockIndex);
                     sdcard_reset();
 
                     // Announce write failure:
@@ -800,6 +837,7 @@ static bool sdcardSpi_poll(void)
 #endif
 
                 sdcard.failureCount = 0; // Assume the card is good if it can complete a write
+                sdcard.diag.writeCompleted++;
 
                 // Still more blocks left to write in a multi-block chain?
                 if (sdcard.multiWriteBlocksRemain > 1) {
@@ -832,6 +870,8 @@ static bool sdcardSpi_poll(void)
                  * their buffer and have no hope of retrying the operation. But this should be very rare and it allows
                  * them to reuse their buffer milliseconds faster than they otherwise would.
                  */
+                sdcard.diag.writeTimeouts++;
+                sdcard_recordError(3, 0, sdcard.pendingOperation.blockIndex);
                 sdcard_reset();
                 goto doMore;
             }
@@ -869,6 +909,8 @@ static bool sdcardSpi_poll(void)
                 case SDCARD_RECEIVE_ERROR:
                     sdcard_deselect();
 
+                    sdcard.diag.readErrors++;
+                    sdcard_recordError(4, 0, sdcard.pendingOperation.blockIndex);
                     sdcard_reset();
 
                     if (sdcard.pendingOperation.callback) {
@@ -896,6 +938,8 @@ static bool sdcardSpi_poll(void)
                 }
 #endif
             } else if (millis() > sdcard.operationStartTime + SDCARD_TIMEOUT_WRITE_MSEC) {
+                sdcard.diag.writeTimeouts++;
+                sdcard_recordError(5, 0, sdcard.pendingOperation.blockIndex);
                 sdcard_reset();
                 goto doMore;
             }
@@ -954,11 +998,15 @@ static sdcardOperationStatus_e sdcardSpi_writeBlock(uint32_t blockIndex, uint8_t
         case SDCARD_STATE_READY:
             // We're not continuing a multi-block write so we need to send a single-block write command
             // Standard size cards use byte addressing, high capacity cards use block addressing
+            sdcard.diag.writeAttempts++;
+            sdcard.diag.lastWriteBlock = blockIndex;
             status = sdcard_sendCommand(SDCARD_COMMAND_WRITE_BLOCK, sdcard.highCapacity ? blockIndex : blockIndex * SDCARD_BLOCK_SIZE);
 
             if (status != 0) {
                 sdcard_deselect();
 
+                sdcard.diag.writeCmdErrors++;
+                sdcard_recordError(1, status, blockIndex);
                 sdcard_reset();
 
                 return SDCARD_OPERATION_FAILURE;
@@ -995,36 +1043,20 @@ static sdcardOperationStatus_e sdcardSpi_writeBlock(uint32_t blockIndex, uint8_t
  */
 static sdcardOperationStatus_e sdcardSpi_beginWriteBlocks(uint32_t blockIndex, uint32_t blockCount)
 {
-    if (sdcard.state != SDCARD_STATE_READY) {
-        if (sdcard.state == SDCARD_STATE_WRITING_MULTIPLE_BLOCKS) {
-            if (blockIndex == sdcard.multiWriteNextBlock) {
-                // Assume that the caller wants to continue the multi-block write they already have in progress!
-                return SDCARD_OPERATION_SUCCESS;
-            } else if (sdcard_endWriteBlocks() != SDCARD_OPERATION_SUCCESS) {
-                return SDCARD_OPERATION_BUSY;
-            } // Else we've completed the previous multi-block write and can fall through to start the new one
-        } else {
+    UNUSED(blockIndex);
+    UNUSED(blockCount);
+
+    // Always write SPI SD blocks individually via CMD24: multi-block ACMD23 + CMD25 both holds
+    // CS across shared SPI2 (MAX7456) and fails to commit payload sectors on some SPI cards
+    // (even when MAX7456 is inactive under HD/MSP OSD), while single-block CMD24 matches USB MSC.
+    if (sdcard.state == SDCARD_STATE_WRITING_MULTIPLE_BLOCKS) {
+        if (sdcard_endWriteBlocks() != SDCARD_OPERATION_SUCCESS) {
             return SDCARD_OPERATION_BUSY;
         }
-    }
-
-    if (
-        sdcard_sendAppCommand(SDCARD_ACOMMAND_SET_WR_BLOCK_ERASE_COUNT, blockCount) == 0
-        && sdcard_sendCommand(SDCARD_COMMAND_WRITE_MULTIPLE_BLOCK, sdcard.highCapacity ? blockIndex : blockIndex * SDCARD_BLOCK_SIZE) == 0
-    ) {
-        sdcard.state = SDCARD_STATE_WRITING_MULTIPLE_BLOCKS;
-        sdcard.multiWriteBlocksRemain = blockCount;
-        sdcard.multiWriteNextBlock = blockIndex;
-
-        // Leave the card selected
-        return SDCARD_OPERATION_SUCCESS;
-    } else {
         sdcard_deselect();
-
-        sdcard_reset();
-
-        return SDCARD_OPERATION_FAILURE;
     }
+
+    return sdcard.state == SDCARD_STATE_READY ? SDCARD_OPERATION_SUCCESS : SDCARD_OPERATION_BUSY;
 }
 
 /**

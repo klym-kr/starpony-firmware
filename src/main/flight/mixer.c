@@ -48,6 +48,7 @@
 #include "flight/alt_hold.h"
 #include "flight/autopilot.h"
 #include "flight/failsafe.h"
+#include "flight/ladrc.h"
 #include "flight/gps_rescue.h"
 #include "flight/imu.h"
 #include "flight/mixer_init.h"
@@ -56,6 +57,9 @@
 #include "flight/rpm_filter.h"
 
 #include "io/gps.h"
+#ifdef USE_COMPANION_LINK
+#include "io/companion_link.h"
+#endif
 
 #include "pg/rx.h"
 
@@ -74,6 +78,12 @@
 #define CRASHFLIP_STICK_DEADBAND         0.15f // 15%
 
 static FAST_DATA_ZERO_INIT float motorMixRange;
+static FAST_DATA float lastMotorMixAuthorityScale = 1.0f;
+
+float FAST_CODE_NOINLINE mixerGetAuthorityScale(void)
+{
+    return lastMotorMixAuthorityScale;
+}
 
 float FAST_DATA_ZERO_INIT motor[MAX_SUPPORTED_MOTORS];
 float motor_disarmed[MAX_SUPPORTED_MOTORS];
@@ -553,7 +563,7 @@ static void updateDynLpfCutoffs(timeUs_t currentTimeUs, float throttle)
 
 DEFINE_SCALE_FN(scaleAirmodeTransition, 0.0f, 0.5f, 0.5f, 1.0f)
 
-static void applyMixerAdjustmentLinear(float *motorMix, const bool airmodeEnabled)
+static float applyMixerAdjustmentLinear(float *motorMix, const bool airmodeEnabled)
 {
     float airmodeTransitionPercent = 1.0f;
     float motorDeltaScale = 0.5f;
@@ -586,6 +596,8 @@ static void applyMixerAdjustmentLinear(float *motorMix, const bool airmodeEnable
 
     // constrain throttle so it won't clip any outputs
     throttle = constrainf(throttle, -minMotor, 1.0f - maxMotor);
+
+    return constrainf(motorMixNormalizationFactor, 0.0f, 1.0f);
 }
 
 static float calcEzLandLimit(float maxDeflection, float speed)
@@ -605,7 +617,7 @@ static float calcEzLandLimit(float maxDeflection, float speed)
     return fmaxf(mixerRuntime.ezLandingLimit, deflectionAndSpeedLimit);
 }
 
-static void applyMixerAdjustmentEzLand(float *motorMix, const float motorMixMin, const float motorMixMax)
+static float applyMixerAdjustmentEzLand(float *motorMix, const float motorMixMin, const float motorMixMax)
 {
     // Calculate factor for normalizing motor mix range to <= 1.0
     const float baseNormalizationFactor = motorMixRange > 1.0f ? 1.0f / motorMixRange : 1.0f;
@@ -650,9 +662,11 @@ static void applyMixerAdjustmentEzLand(float *motorMix, const float motorMixMin,
     DEBUG_SET(DEBUG_EZLANDING, 2, upperLimit * 10000U);
     DEBUG_SET(DEBUG_EZLANDING, 3, fminf(1.0f, ezLandLimit / absMotorMixMin) * 10000U);
     // DEBUG_EZLANDING 4 and 5 is the upper limits based on stick input and speed respectively
+
+    return constrainf(normalizationFactor, 0.0f, 1.0f);
 }
 
-static void applyMixerAdjustment(float *motorMix, const float motorMixMin, const float motorMixMax, const bool airmodeEnabled)
+static float applyMixerAdjustment(float *motorMix, const float motorMixMin, const float motorMixMax, const bool airmodeEnabled)
 {
     float airmodeTransitionPercent = 1.0f;
 
@@ -671,6 +685,8 @@ static void applyMixerAdjustment(float *motorMix, const float motorMixMin, const
     const float normalizedMotorMixMin = motorMixMin * motorMixNormalizationFactor;
     const float normalizedMotorMixMax = motorMixMax * motorMixNormalizationFactor;
     throttle = constrainf(throttle, -normalizedMotorMixMin, 1.0f - normalizedMotorMixMax);
+
+    return constrainf(motorMixNormalizationFactor, 0.0f, 1.0f);
 }
 
 FAST_CODE_NOINLINE void mixTable(timeUs_t currentTimeUs)
@@ -678,10 +694,15 @@ FAST_CODE_NOINLINE void mixTable(timeUs_t currentTimeUs)
     const bool launchControlActive = isLaunchControlActive();
     const bool airmodeEnabled = isAirmodeEnabled() || launchControlActive;
 
+    if (!ARMING_FLAG(ARMED)) {
+        mixerServiceDisarmedTimeout(currentTimeUs);
+    }
+
     // Find min and max throttle based on conditions. Throttle has to be known before mixing
     calculateThrottleAndCurrentMotorEndpoints(currentTimeUs);
 
     if (applyCrashFlipModeToMotors()) {
+        lastMotorMixAuthorityScale = 0.0f;
         return;
         // if crash flip modeis being applied to the motors, mixing is done
 
@@ -797,6 +818,18 @@ FAST_CODE_NOINLINE void mixTable(timeUs_t currentTimeUs)
     }
 #endif
 
+    bool companionAutonomousThrottle = false;
+#ifdef USE_COMPANION_LINK
+    if (companionLinkIsOffboardActive()) {
+        throttle = companionLinkGetSetpoint()->target[3];
+        companionAutonomousThrottle = true;
+    } else if (companionLinkIsLevelHoldActive()
+        || (companionLinkShouldTriggerRth() && !FLIGHT_MODE(GPS_RESCUE_MODE))) {
+        throttle = companionLinkGetFailsafeThrottle();
+        companionAutonomousThrottle = true;
+    }
+#endif
+
 #ifdef USE_ALTITUDE_HOLD
     // Throttle value to be used during altitude hold mode (and failsafe landing mode)
     if (FLIGHT_MODE(ALT_HOLD_MODE)) {
@@ -813,32 +846,45 @@ FAST_CODE_NOINLINE void mixTable(timeUs_t currentTimeUs)
 #endif
 
     motorMixRange = motorMixMax - motorMixMin;
+    // ADRC-033: Publish saturation flag if any motor demand exceeded saturation limits
+    ladrcSetMixerSaturated(motorMixRange > 1.0f);
 
     // note that here airmodeEnabled is true also when Launch Control is active
+    float mixAuthorityScale = 1.0f;
     switch (mixerConfig()->mixer_type) {
     case MIXER_LEGACY:
-        applyMixerAdjustment(motorMix, motorMixMin, motorMixMax, airmodeEnabled);
+        mixAuthorityScale = applyMixerAdjustment(motorMix, motorMixMin, motorMixMax, airmodeEnabled);
         break;
     case MIXER_LINEAR:
     case MIXER_DYNAMIC:
-        applyMixerAdjustmentLinear(motorMix, airmodeEnabled);
+        mixAuthorityScale = applyMixerAdjustmentLinear(motorMix, airmodeEnabled);
         break;
     case MIXER_EZLANDING:
-        applyMixerAdjustmentEzLand(motorMix, motorMixMin, motorMixMax);
+        mixAuthorityScale = applyMixerAdjustmentEzLand(motorMix, motorMixMin, motorMixMax);
         break;
     default:
-        applyMixerAdjustment(motorMix, motorMixMin, motorMixMax, airmodeEnabled);
+        mixAuthorityScale = applyMixerAdjustment(motorMix, motorMixMin, motorMixMax, airmodeEnabled);
         break;
+    }
+
+    if (isFixedWing()) {
+        // Fixed-wing roll/pitch/yaw comes from aerodynamic servos (servos.c reads pidData[axis].Sum directly),
+        // not multirotor motor differential mixing, so low-throttle airmodeTransitionPercent must not attenuate LADRC authority.
+        mixAuthorityScale = FLIGHT_MODE(PASSTHRU_MODE) ? 0.0f : 1.0f;
     }
 
     if (featureIsEnabled(FEATURE_MOTOR_STOP)
         && ARMING_FLAG(ARMED)
         && !mixerRuntime.feature3dEnabled
         && !airmodeEnabled
+        && !companionAutonomousThrottle
         && !FLIGHT_MODE(GPS_RESCUE_MODE | ALT_HOLD_MODE | POS_HOLD_MODE)   // disable motor_stop while GPS Rescue / Alt Hold / Pos Hold is active
         && (rcData[THROTTLE] < rxConfig()->mincheck)) {
+        // Fixed-wing aerodynamic servos retain control authority while motor is stopped on glide
+        lastMotorMixAuthorityScale = isFixedWing() ? mixAuthorityScale : 0.0f;
         applyMotorStop();
     } else {
+        lastMotorMixAuthorityScale = (!ARMING_FLAG(ARMED)) ? 0.0f : mixAuthorityScale;
         // Apply the mix to motor endpoints
         applyMixToMotors(motorMix, activeMixer);
     }

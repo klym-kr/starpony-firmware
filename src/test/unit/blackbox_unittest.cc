@@ -16,6 +16,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <vector>
 
 extern "C" {
     #include "platform.h"
@@ -23,6 +24,9 @@ extern "C" {
     #include "build/debug.h"
 
     #include "blackbox/blackbox.h"
+    #include "blackbox/blackbox_io.h"
+    #include "blackbox/blackbox_sbl.h"
+    #include "blackbox/blackbox_fielddefs.h"
     #include "common/utils.h"
 
     #include "pg/pg.h"
@@ -40,6 +44,7 @@ extern "C" {
 
     #include "fc/rc_controls.h"
     #include "fc/rc_modes.h"
+    #include "fc/runtime_config.h"
 
     #include "io/gps.h"
     #include "io/serial.h"
@@ -330,7 +335,14 @@ TEST(BlackboxTest, Test_CalculateRates)
 }
 
 
-// STUBS
+static uint32_t testMillis = 0;
+static uint32_t testMicros = 0;
+static uint32_t testSerialWrittenCount = 0;
+static std::vector<uint8_t> testSerialStream;
+static uint32_t testSerialFreeLimit = 1024;
+static serialPort_t testSerialPort = {};
+static serialPortConfig_t testSerialPortConfig = {};
+
 extern "C" {
 
 PG_REGISTER(flight3DConfig_t, flight3DConfig, PG_MOTOR_3D_CONFIG, 0);
@@ -369,22 +381,109 @@ uint8_t getMotorCount(void) {return 4;}
 bool areMotorsRunning(void) { return false; }
 bool IS_RC_MODE_ACTIVE(boxId_e) {return false;}
 bool isModeActivationConditionPresent(boxId_e) {return false;}
-uint32_t millis(void) {return 0;}
+uint32_t millis(void) {return testMillis;}
+uint32_t micros(void) {return testMicros;}
 bool sensors(uint32_t) {return false;}
-void serialWrite(serialPort_t *, uint8_t) {}
-uint32_t serialTxBytesFree(const serialPort_t *) {return 0;}
-bool isSerialTransmitBufferEmpty(const serialPort_t *) {return false;}
+void serialWrite(serialPort_t *, uint8_t ch) { testSerialStream.push_back(ch); testSerialWrittenCount++; }
+uint32_t serialTxBytesFree(const serialPort_t *) {return testSerialFreeLimit;}
+bool isSerialTransmitBufferEmpty(const serialPort_t *) {return true;}
 bool featureIsEnabled(uint32_t) {return false;}
 void mspSerialReleasePortIfAllocated(serialPort_t *) {}
-const serialPortConfig_t *findSerialPortConfig(serialPortFunction_e ) {return NULL;}
+const serialPortConfig_t *findSerialPortConfig(serialPortFunction_e ) {return &testSerialPortConfig;}
 serialPort_t *findSharedSerialPort(uint16_t , serialPortFunction_e ) {return NULL;}
-serialPort_t *openSerialPort(serialPortIdentifier_e, serialPortFunction_e, serialReceiveCallbackPtr, void *, uint32_t, portMode_e, portOptions_e) {return NULL;}
+serialPort_t *openSerialPort(serialPortIdentifier_e, serialPortFunction_e, serialReceiveCallbackPtr, void *, uint32_t, portMode_e, portOptions_e) {return &testSerialPort;}
 void closeSerialPort(serialPort_t *) {}
 portSharing_e determinePortSharing(const serialPortConfig_t *, serialPortFunction_e ) {return PORTSHARING_UNUSED;}
 failsafePhase_e failsafePhase(void) {return FAILSAFE_IDLE;}
 bool rxAreFlightChannelsValid(void) {return false;}
 bool isRxReceivingSignal(void) {return false;}
 bool isRssiConfigured(void) {return false;}
-float getMotorOutputLow(void) {return 0.0;}
-float getMotorOutputHigh(void) {return 0.0;}
+float getMotorOutputLow(void) {return 1000.0f;}
+float getMotorOutputHigh(void) {return 2000.0f;}
+}
+
+TEST(BlackboxTest, Test_SblEndToEndPartialWriteAndCrc)
+{
+    testSerialStream.clear();
+    testSerialWrittenCount = 0;
+    testSerialPortConfig.blackbox_baudrateIndex = 12; // BAUD_1000000
+    testMillis = 0;
+    testMicros = 1000;
+    targetPidLooptime = 500;
+    armingFlags = 0;
+
+    blackboxConfigMutable()->device = BLACKBOX_DEVICE_SERIAL;
+    blackboxConfigMutable()->mode = 0;
+    blackboxConfigMutable()->sample_rate = 0;
+    blackboxConfigMutable()->fields_disabled_mask = 0;
+    blackboxInit();
+    EXPECT_TRUE(blackboxMayEditConfig());
+
+    // Arm and advance millis past 25ms settle; throttle serial buffer to 37B per write
+    // so SessionHeader (162B) requires 5 partial writes with zero drops.
+    testSerialFreeLimit = 37;
+    armingFlags = ARMED;
+    blackboxUpdate(testMicros);
+    EXPECT_FALSE(blackboxMayEditConfig());
+
+    // PREPARE_LOG_FILE -> SEND_HEADER
+    blackboxUpdate(testMicros);
+    testMillis = 40;
+    for (int i = 0; i < 6; i++) {
+        testMicros += 500;
+        blackboxUpdate(testMicros);
+    }
+
+    // Pump 6 frames through CACHE_FLUSH + RUNNING
+    testSerialFreeLimit = 512;
+    for (int i = 0; i < 8; i++) {
+        testMicros += 500;
+        blackboxUpdate(testMicros);
+    }
+
+    // Disarm and flush footer cleanly
+    armingFlags = 0;
+    blackboxFinish();
+    for (int i = 0; i < 6; i++) {
+        testMillis += 10;
+        testMicros += 500;
+        blackboxUpdate(testMicros);
+    }
+    EXPECT_TRUE(blackboxMayEditConfig());
+    ASSERT_GE(testSerialStream.size(), sizeof(sblChunkHdr_t) + sizeof(sblSessionHeader_t) + 2);
+
+    // Parse all chunks in testSerialStream and verify magic, seq continuity, and CRC16
+    size_t pos = 0;
+    uint16_t expectedSeq = 0;
+    bool sawHeader = false;
+    bool sawBatch = false;
+    bool sawFooter = false;
+    while (pos + sizeof(sblChunkHdr_t) + 2 <= testSerialStream.size()) {
+        sblChunkHdr_t hdr;
+        memcpy(&hdr, testSerialStream.data() + pos, sizeof(hdr));
+        ASSERT_EQ(SBL_CHUNK_MAGIC_LE, hdr.magic);
+        ASSERT_EQ(expectedSeq++, hdr.seq);
+        ASSERT_LE(pos + sizeof(hdr) + hdr.payloadLen + 2, testSerialStream.size());
+
+        const uint16_t calcCrc = sblCrc16Ccitt(testSerialStream.data() + pos + 2, sizeof(hdr) - 2 + hdr.payloadLen);
+        const uint16_t wireCrc = (uint16_t)testSerialStream[pos + sizeof(hdr) + hdr.payloadLen]
+            | ((uint16_t)testSerialStream[pos + sizeof(hdr) + hdr.payloadLen + 1] << 8);
+        ASSERT_EQ(calcCrc, wireCrc);
+
+        if (hdr.type == SBL_CHUNK_SESSION_HEADER) {
+            EXPECT_EQ(sizeof(sblSessionHeader_t), hdr.payloadLen);
+            sawHeader = true;
+        } else if (hdr.type == SBL_CHUNK_LADRC_BATCH) {
+            EXPECT_EQ(0U, hdr.payloadLen % SBL_FULL_FRAME_SIZE(4));
+            sawBatch = true;
+        } else if (hdr.type == SBL_CHUNK_SESSION_FOOTER) {
+            EXPECT_EQ(sizeof(sblSessionFooter_t), hdr.payloadLen);
+            sawFooter = true;
+        }
+        pos += sizeof(hdr) + hdr.payloadLen + 2;
+    }
+    EXPECT_EQ(testSerialStream.size(), pos);
+    EXPECT_TRUE(sawHeader);
+    EXPECT_TRUE(sawBatch);
+    EXPECT_TRUE(sawFooter);
 }

@@ -43,6 +43,7 @@ extern int32_t blackboxHeaderBudget;
 void blackboxOpen(void);
 void blackboxWrite(uint8_t value);
 int blackboxWriteString(const char *s);
+uint32_t blackboxDeviceWrite(const uint8_t *buffer, uint32_t length);
 
 void blackboxDeviceFlush(void);
 bool blackboxDeviceFlushForce(void);
@@ -53,6 +54,7 @@ void blackboxDeviceClose(void);
 
 void blackboxEraseAll(void);
 bool isBlackboxErased(void);
+void blackboxResetSDCard(void);
 
 bool blackboxDeviceBeginLog(void);
 bool blackboxDeviceEndLog(bool retainLog);

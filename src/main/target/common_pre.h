@@ -193,48 +193,27 @@
 #define USE_MAX7456
 #endif
 
-#if !defined(USE_RX_SPI)
-#define USE_RX_SPI
-
-#define USE_RX_CC2500
-#define USE_RX_EXPRESSLRS
-#define USE_RX_SX1280
-#define USE_RX_SX127X
-#endif // !USE_RX_SPI
-
 #if !defined(USE_EXST) && !defined(USE_SDCARD)
 #define USE_SDCARD
 #endif
 
 #endif // !defined(USE_CONFIG)
 
-#define USE_RX_PPM
-#define USE_RX_PWM
-
 #define USE_PINIO
 
 #if !defined(USE_SERIAL_RX)
 
+// St4rpony: CRSF is the sole supported receiver protocol for now
 #define USE_SERIALRX
-#define USE_SERIALRX_CRSF       // Team Black Sheep Crossfire protocol
-#define USE_SERIALRX_GHST       // ImmersionRC Ghost Protocol
-#define USE_SERIALRX_IBUS       // FlySky and Turnigy receivers
-#define USE_SERIALRX_SBUS       // Frsky and Futaba receivers
-#define USE_SERIALRX_SPEKTRUM   // SRXL, DSM2 and DSMX protocol
-#define USE_SERIALRX_FPORT      // FrSky FPort
-#define USE_SERIALRX_XBUS       // JR
-#define USE_SERIALRX_SRXL2      // Spektrum SRXL2 protocol
+#define USE_SERIALRX_CRSF       // Team Black Sheep Crossfire / ExpressLRS CRSF
 
 #endif // !defined(USE_SERIAL_RX)
 
 #if !defined(USE_TELEMETRY)
 #define USE_TELEMETRY
 
-#define USE_TELEMETRY_FRSKY_HUB
-#define USE_TELEMETRY_SMARTPORT
+// St4rpony: CRSF telemetry only (toggleable via FEATURE_TELEMETRY)
 #define USE_TELEMETRY_CRSF
-#define USE_TELEMETRY_GHST
-#define USE_TELEMETRY_SRXL
 
 #endif // !defined(USE_TELEMETRY)
 
@@ -250,25 +229,6 @@
 
 #if TARGET_FLASH_SIZE >= 1024
 
-#if defined(USE_SERIALRX)
-
-#define USE_SERIALRX_JETIEXBUS
-#define USE_SERIALRX_SUMD       // Graupner Hott protocol
-#define USE_SERIALRX_SUMH       // Graupner legacy protocol
-#define USE_SERIALRX_MAVLINK    // MAVLink protocol for serial RX
-#endif // USE_SERIALRX
-
-#if defined(USE_TELEMETRY)
-
-#define USE_TELEMETRY_IBUS
-#define USE_TELEMETRY_IBUS_EXTENDED
-#define USE_TELEMETRY_JETIEXBUS
-#define USE_TELEMETRY_MAVLINK
-#define USE_TELEMETRY_HOTT
-#define USE_TELEMETRY_LTM
-
-#endif // USE_TELEMETRY
-
 #ifdef USE_DSHOT_TELEMETRY
 #define USE_RPM_LIMIT
 #endif
@@ -277,14 +237,11 @@
 // Dependency for CMS is defined outside this block.
 #define USE_OSD_QUICK_MENU
 #define USE_RC_STATS
-#define USE_SPEC_PREARM_SCREEN
 #endif
 
 #define USE_BATTERY_CONTINUE
-#define USE_DASHBOARD
 #define USE_EMFAT_AUTORUN
 #define USE_EMFAT_ICON
-#define USE_ESCSERIAL_SIMONK
 #define USE_ALTITUDE_HOLD
 #define USE_POSITION_HOLD
 
@@ -295,17 +252,6 @@
 #if !defined(USE_GPS_PLUS_CODES)
 #define USE_GPS_PLUS_CODES
 #endif
-
-#if !defined(USE_LED_STRIP)
-#define USE_LED_STRIP
-#endif
-
-#define USE_SERIAL_4WAY_SK_BOOTLOADER
-
-#define USE_VTX_RTC6705
-#define USE_VTX_RTC6705_SOFTSPI
-
-#define USE_TRANSPONDER
 
 #define USE_RANGEFINDER
 #define USE_RANGEFINDER_HCSR04
@@ -368,7 +314,6 @@
 #define USE_VIRTUAL_CURRENT_METER
 #define USE_ESC_SENSOR
 #define USE_SERIAL_4WAY_BLHELI_BOOTLOADER
-#define USE_RCDEVICE
 
 #define USE_GYRO_LPF2
 #define USE_DYN_LPF
@@ -380,6 +325,9 @@
 #define USE_ITERM_RELAX
 #define USE_RC_SMOOTHING_FILTER
 #define USE_THRUST_LINEARIZATION
+
+#define USE_LADRC
+#define USE_COMPANION_LINK
 
 #ifdef USE_SERIALRX_SPEKTRUM
 #define USE_SPEKTRUM_BIND
@@ -416,7 +364,6 @@
 #define USE_SENSOR_NAMES
 #define USE_UNCOMMON_MIXERS
 #define USE_SIGNATURE
-#define USE_HOTT_TEXTMODE
 #define USE_ESC_SENSOR_TELEMETRY
 #define USE_TELEMETRY_SENSORS_DISABLED_DETAILS
 #define USE_PERSISTENT_STATS

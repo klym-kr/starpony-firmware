@@ -136,7 +136,6 @@ battery_profile_unittest_SRC := \
 
 blackbox_unittest_SRC :=  \
 		$(USER_DIR)/blackbox/blackbox.c \
-		$(USER_DIR)/blackbox/blackbox_encoding.c \
 		$(USER_DIR)/blackbox/blackbox_io.c \
 		$(USER_DIR)/common/encoding.c \
 		$(USER_DIR)/common/printf.c \
@@ -551,16 +550,40 @@ pid_unittest_SRC :=  \
 		$(USER_DIR)/drivers/accgyro/gyro_sync.c \
 		$(USER_DIR)/fc/controlrate_profile.c \
 		$(USER_DIR)/fc/runtime_config.c \
+		$(USER_DIR)/flight/ladrc.c \
 		$(USER_DIR)/flight/pid.c \
 		$(USER_DIR)/flight/pid_init.c \
 		$(USER_DIR)/pg/pg.c
 
 pid_unittest_DEFINES := \
+		USE_LADRC= \
 		USE_ITERM_RELAX= \
 		USE_RC_SMOOTHING_FILTER= \
 		USE_LAUNCH_CONTROL= \
 		USE_FEEDFORWARD= \
 		USE_ADVANCED_TPA= \
+		USE_ACRO_TRAINER= \
+
+ladrc_unittest_SRC := \
+		$(USER_DIR)/common/crc.c \
+		$(USER_DIR)/common/maths.c \
+		$(USER_DIR)/common/streambuf.c \
+		$(USER_DIR)/flight/ladrc.c \
+		$(USER_DIR)/pg/pg.c
+
+ladrc_unittest_DEFINES := \
+		USE_LADRC=
+
+companion_link_unittest_SRC := \
+		$(USER_DIR)/common/crc.c \
+		$(USER_DIR)/common/maths.c \
+		$(USER_DIR)/common/streambuf.c \
+		$(USER_DIR)/fc/runtime_config.c \
+		$(USER_DIR)/io/companion_link.c \
+		$(USER_DIR)/pg/pg.c
+
+companion_link_unittest_DEFINES := \
+		USE_COMPANION_LINK=
 
 position_rescue_geometry_unittest_SRC := \
 		$(USER_DIR)/common/maths.c

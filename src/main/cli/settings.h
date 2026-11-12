@@ -165,6 +165,9 @@ typedef enum {
 #ifdef USE_TRANSPONDER
     TABLE_TRANSPONDER_PROVIDER,
 #endif
+#ifdef USE_COMPANION_LINK
+    TABLE_COMPANION_FAILSAFE,
+#endif
     LOOKUP_TABLE_COUNT
 } lookupTableIndex_e;
 

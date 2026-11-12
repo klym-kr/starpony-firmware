@@ -177,6 +177,32 @@ bool sdcard_isInitialized(void)
     return sdcardVTable->sdcard_isInitialized();
 }
 
+bool sdcard_isBusy(void)
+{
+    if (!sdcardVTable) {
+        return false;
+    }
+    return sdcard.state >= SDCARD_STATE_INITIALIZATION_RECEIVE_CID && sdcard.state != SDCARD_STATE_READY;
+}
+
+uint32_t sdcard_getWriteErrorCount(void)
+{
+    return sdcard.writeErrorCount;
+}
+
+void sdcard_getDiagStats(sdcardDiagStats_t *stats)
+{
+    if (!stats) {
+        return;
+    }
+    *stats = sdcard.diag;
+#if defined(USE_SDCARD_SPI) && defined(USE_DMA)
+    stats->spiDmaEnabled = spiUseSDO_DMA(&sdcard.dev);
+#else
+    stats->spiDmaEnabled = false;
+#endif
+}
+
 const sdcardMetadata_t* sdcard_getMetadata(void)
 {
     return sdcardVTable->sdcard_getMetadata();

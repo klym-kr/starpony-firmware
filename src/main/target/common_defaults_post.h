@@ -21,7 +21,7 @@
 // pg/max7456
 
 #ifndef DEBUG_MODE
-#define DEBUG_MODE DEBUG_NONE
+#define DEBUG_MODE DEBUG_LADRC
 #endif
 
 #ifndef I2C0_CLOCKSPEED

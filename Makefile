@@ -54,7 +54,7 @@ CFLAGS_DISABLED         ?=
 # Things that need to be maintained as the source changes
 #
 
-FORKNAME      = betaflight
+FORKNAME      = st4rpony
 
 # Working directories
 # ROOT_DIR is the full path to the directory containing this Makefile

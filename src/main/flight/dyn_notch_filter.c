@@ -30,6 +30,7 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "platform.h"
 
@@ -155,6 +156,13 @@ static FAST_DATA_ZERO_INIT float   pt1LooptimeS;
 
 void dynNotchInit(const dynNotchConfig_t *config, const float dt)
 {
+    // Reset downsampling and SDFT batch state so changing maxHz / sampleCount at runtime never desynchronizes sampleIndex
+    sampleIndex = 0;
+    memset(sampleAccumulator, 0, sizeof(sampleAccumulator));
+    memset(sampleAvg, 0, sizeof(sampleAvg));
+    memset(&state, 0, sizeof(state));
+    dynNotch.maxCenterFreq = 0;
+
     // dynNotchUpdate() is running at looprateHz (which is the PID looprate aka. 1e6f / gyro.targetLooptime)
     const float looprateHz = 1.0f / dt;
     const float nyquistHz = looprateHz / 2.0f;

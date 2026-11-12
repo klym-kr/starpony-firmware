@@ -48,9 +48,13 @@
 #include "flight/autopilot.h"
 #include "flight/gps_rescue.h"
 #include "flight/imu.h"
+#include "flight/ladrc.h"
 #include "flight/mixer.h"
 
 #include "io/gps.h"
+#ifdef USE_COMPANION_LINK
+#include "io/companion_link.h"
+#endif
 
 #include "pg/autopilot.h"
 #include "pg/pg.h"
@@ -261,21 +265,6 @@ void resetPidProfile(pidProfile_t *pidProfile)
     );
 }
 
-static bool isTpaActive(tpaMode_e tpaMode, term_e term) {
-    switch (tpaMode) {
-    case TPA_MODE_PD:
-        return term == TERM_P || term == TERM_D;
-    case TPA_MODE_D:
-        return term == TERM_D;
-#ifdef USE_WING
-    case TPA_MODE_PDS:
-        return term == TERM_P || term == TERM_D || term == TERM_S;
-#endif
-    default:
-        return false;
-    }
-}
-
 void pgResetFn_pidProfiles(pidProfile_t *pidProfiles)
 {
     for (int i = 0; i < PID_PROFILE_COUNT; i++) {
@@ -302,6 +291,11 @@ void pidStabilisationState(pidStabilisationState_e pidControllerState)
     pidRuntime.pidStabilisationEnabled = (pidControllerState == PID_STABILISATION_ON) ? true : false;
 }
 
+bool pidIsStabilisationEnabled(void)
+{
+    return pidRuntime.pidStabilisationEnabled;
+}
+
 const angle_index_t rcAliasToAngleIndexMap[] = { AI_ROLL, AI_PITCH };
 
 void pidResetIterm(void)
@@ -309,9 +303,17 @@ void pidResetIterm(void)
     for (int axis = 0; axis < 3; axis++) {
         pidData[axis].I = 0.0f;
     }
+#ifdef USE_LADRC
+    ladrcResetDisturbance();
+#endif
 }
 
 #ifdef USE_WING
+float pidGetWingAirspeedCms(void)
+{
+    return pidRuntime.tpaSpeed.speed * 100.0f;
+}
+
 static float calcWingThrottle(void)
 {
     float batteryThrottleFactor = 1.0f;
@@ -336,6 +338,13 @@ static float calcWingAcceleration(float throttle, float pitchAngleRadians)
 
 static float calcWingTpaArgument(void)
 {
+    if (!ARMING_FLAG(ARMED)) {
+        pidRuntime.tpaSpeed.speed = 0.0f;
+        DEBUG_SET(DEBUG_TPA, 4, 0);
+        DEBUG_SET(DEBUG_TPA, 5, 0);
+        return 0.0f;
+    }
+
     const float t = calcWingThrottle();
     const float pitchRadians = DECIDEGREES_TO_RADIANS(attitude.values.pitch);
     const float rollRadians = DECIDEGREES_TO_RADIANS(attitude.values.roll);
@@ -583,6 +592,24 @@ STATIC_UNIT_TESTED FAST_CODE_NOINLINE float pidLevel(int axis, const pidProfile_
     }
 #endif // USE_WING
 
+#ifdef USE_COMPANION_LINK
+    const bool companionAttitudeActive = companionLinkIsOffboardActive()
+        && (companionLinkGetSetpoint()->mode == COMPANION_MODE_ATTITUDE_THRUST);
+    const bool companionLevelHold = companionLinkIsLevelHoldActive()
+        || (companionLinkShouldTriggerRth() && !FLIGHT_MODE(GPS_RESCUE_MODE));
+    if (companionAttitudeActive) {
+        const companionSetpoint_t *sp = companionLinkGetSetpoint();
+        angleTarget = sp->target[axis];
+        angleFeedforward = 0.0f;
+    } else if (companionLevelHold) {
+        angleTarget = 0.0f;
+        angleFeedforward = 0.0f;
+    }
+#else
+    const bool companionAttitudeActive = false;
+    const bool companionLevelHold = false;
+#endif
+
 #ifdef USE_GPS_RESCUE
     if (FLIGHT_MODE(GPS_RESCUE_MODE)) {
         angleTarget = autopilotAngle[axis]; // autopilotAngle in degrees
@@ -622,7 +649,7 @@ STATIC_UNIT_TESTED FAST_CODE_NOINLINE float pidLevel(int axis, const pidProfile_
     // this filter runs at ATTITUDE_CUTOFF_HZ, currently 50hz, so GPS roll may be a bit steppy
     angleRate = pt3FilterApply(&pidRuntime.attitudeFilter[axis], angleRate);
 
-    if (FLIGHT_MODE(ANGLE_MODE| GPS_RESCUE_MODE | POS_HOLD_MODE)) {
+    if (FLIGHT_MODE(ANGLE_MODE | GPS_RESCUE_MODE | POS_HOLD_MODE) || companionAttitudeActive || companionLevelHold) {
         currentPidSetpoint = angleRate;
     } else {
         // can only be HORIZON mode - crossfade Angle rate and Acro rate
@@ -648,7 +675,8 @@ STATIC_UNIT_TESTED FAST_CODE_NOINLINE float pidLevel(int axis, const pidProfile_
 
 static FAST_CODE_NOINLINE void handleCrashRecovery(
     const pidCrashRecovery_e crash_recovery, const rollAndPitchTrims_t *angleTrim,
-    const int axis, const timeUs_t currentTimeUs, const float gyroRate, float *currentPidSetpoint, float *errorRate)
+    const int axis, const timeUs_t currentTimeUs, const float gyroRate, float *currentPidSetpoint, float *errorRate,
+    bool *resetDisturbance)
 {
     if (pidRuntime.inCrashRecoveryMode && cmpTimeUs(currentTimeUs, pidRuntime.crashDetectedAtUs) > pidRuntime.crashTimeDelayUs) {
         if (crash_recovery == PID_CRASH_RECOVERY_BEEP) {
@@ -656,6 +684,7 @@ static FAST_CODE_NOINLINE void handleCrashRecovery(
         }
         if (axis == FD_YAW) {
             *errorRate = constrainf(*errorRate, -pidRuntime.crashLimitYaw, pidRuntime.crashLimitYaw);
+            *currentPidSetpoint = gyroRate + *errorRate;
         } else {
             // on roll and pitch axes calculate currentPidSetpoint and errorRate to level the aircraft to recover from crash
             if (sensors(SENSOR_ACC)) {
@@ -665,9 +694,10 @@ static FAST_CODE_NOINLINE void handleCrashRecovery(
                 *errorRate = *currentPidSetpoint - gyroRate;
             }
         }
-        // reset iterm, since accumulated error before crash is now meaningless
-        // and iterm windup during crash recovery can be extreme, especially on yaw axis
-        pidData[axis].I = 0.0f;
+        // Reset LADRC disturbance windup before stepping LSEF while keeping Order-2 D-term damping active
+        if (resetDisturbance) {
+            *resetDisturbance = true;
+        }
         if (cmpTimeUs(currentTimeUs, pidRuntime.crashDetectedAtUs) > pidRuntime.crashTimeLimitUs
             || (getMotorMixRange() < 1.0f
                    && fabsf(gyro.gyroADCf[FD_ROLL]) < pidRuntime.crashRecoveryRate
@@ -692,28 +722,31 @@ static FAST_CODE_NOINLINE void detectAndSetCrashRecovery(
     const pidCrashRecovery_e crash_recovery, const int axis,
     const timeUs_t currentTimeUs, const float delta, const float errorRate)
 {
+    if (!ARMING_FLAG(ARMED)) {
+        if (pidRuntime.inCrashRecoveryMode) {
+            pidRuntime.inCrashRecoveryMode = false;
+            BEEP_OFF;
+        }
+        return;
+    }
+
     // if crash recovery is on and accelerometer enabled and there is no gyro overflow, then check for a crash
     // no point in trying to recover if the crash is so severe that the gyro overflows
     if ((crash_recovery || FLIGHT_MODE(GPS_RESCUE_MODE)) && !gyroOverflowDetected()) {
-        if (ARMING_FLAG(ARMED)) {
-            if (getMotorMixRange() >= 1.0f && !pidRuntime.inCrashRecoveryMode
-                && fabsf(delta) > pidRuntime.crashDtermThreshold
-                && fabsf(errorRate) > pidRuntime.crashGyroThreshold
-                && fabsf(getSetpointRate(axis)) < pidRuntime.crashSetpointThreshold) {
-                if (crash_recovery == PID_CRASH_RECOVERY_DISARM) {
-                    setArmingDisabled(ARMING_DISABLED_CRASH_DETECTED);
-                    disarm(DISARM_REASON_CRASH_PROTECTION);
-                } else {
-                    pidRuntime.inCrashRecoveryMode = true;
-                    pidRuntime.crashDetectedAtUs = currentTimeUs;
-                }
+        if (getMotorMixRange() >= 1.0f && !pidRuntime.inCrashRecoveryMode
+            && fabsf(delta) > pidRuntime.crashDtermThreshold
+            && fabsf(errorRate) > pidRuntime.crashGyroThreshold
+            && fabsf(getSetpointRate(axis)) < pidRuntime.crashSetpointThreshold) {
+            if (crash_recovery == PID_CRASH_RECOVERY_DISARM) {
+                setArmingDisabled(ARMING_DISABLED_CRASH_DETECTED);
+                disarm(DISARM_REASON_CRASH_PROTECTION);
+            } else {
+                pidRuntime.inCrashRecoveryMode = true;
+                pidRuntime.crashDetectedAtUs = currentTimeUs;
             }
-            if (pidRuntime.inCrashRecoveryMode && cmpTimeUs(currentTimeUs, pidRuntime.crashDetectedAtUs) < pidRuntime.crashTimeDelayUs && (fabsf(errorRate) < pidRuntime.crashGyroThreshold
-                || fabsf(getSetpointRate(axis)) > pidRuntime.crashSetpointThreshold)) {
-                pidRuntime.inCrashRecoveryMode = false;
-                BEEP_OFF;
-            }
-        } else if (pidRuntime.inCrashRecoveryMode) {
+        }
+        if (pidRuntime.inCrashRecoveryMode && cmpTimeUs(currentTimeUs, pidRuntime.crashDetectedAtUs) < pidRuntime.crashTimeDelayUs && (fabsf(errorRate) < pidRuntime.crashGyroThreshold
+            || fabsf(getSetpointRate(axis)) > pidRuntime.crashSetpointThreshold)) {
             pidRuntime.inCrashRecoveryMode = false;
             BEEP_OFF;
         }
@@ -739,7 +772,7 @@ int acroTrainerSign(float x)
 // Use the FAST_CODE_NOINLINE directive to avoid this code from being inlined into ITCM RAM. We accept the
 // performance decrease when Acro Trainer mode is active under the assumption that user is unlikely to be
 // expecting ultimate flight performance at very high loop rates when in this mode.
-static FAST_CODE_NOINLINE float applyAcroTrainer(int axis, const rollAndPitchTrims_t *angleTrim, float setPoint)
+static FAST_CODE_NOINLINE float applyAcroTrainer(int axis, const rollAndPitchTrims_t *angleTrim, float setPoint, bool *resetDisturbance)
 {
     float ret = setPoint;
 
@@ -779,8 +812,8 @@ static FAST_CODE_NOINLINE float applyAcroTrainer(int axis, const rollAndPitchTri
             }
         }
 
-        if (resetIterm) {
-            pidData[axis].I = 0;
+        if (resetIterm && resetDisturbance) {
+            *resetDisturbance = true;
         }
 
         if (axis == pidRuntime.acroTrainerDebugAxis) {
@@ -807,76 +840,6 @@ static float accelerationLimit(int axis, float currentPidSetpoint)
     previousSetpoint[axis] = currentPidSetpoint;
     return currentPidSetpoint;
 }
-
-static void rotateVector(float v[XYZ_AXIS_COUNT], const float rotation[XYZ_AXIS_COUNT])
-{
-    // rotate v around rotation vector rotation
-    // rotation in radians, all elements must be small
-    for (int i = 0; i < XYZ_AXIS_COUNT; i++) {
-        int i_1 = (i + 1) % 3;
-        int i_2 = (i + 2) % 3;
-        float newV = v[i_1] + v[i_2] * rotation[i];
-        v[i_2] -= v[i_1] * rotation[i];
-        v[i_1] = newV;
-    }
-}
-
-STATIC_UNIT_TESTED void rotateItermAndAxisError(void)
-{
-    if (pidRuntime.itermRotation) {
-        const float gyroToAngle = pidRuntime.dT * RAD;
-        float rotationRads[XYZ_AXIS_COUNT];
-        for (int i = FD_ROLL; i <= FD_YAW; i++) {
-            rotationRads[i] = gyro.gyroADCf[i] * gyroToAngle;
-        }
-        if (pidRuntime.itermRotation) {
-            float v[XYZ_AXIS_COUNT];
-            for (int i = 0; i < XYZ_AXIS_COUNT; i++) {
-                v[i] = pidData[i].I;
-            }
-            rotateVector(v, rotationRads );
-            for (int i = 0; i < XYZ_AXIS_COUNT; i++) {
-                pidData[i].I = v[i];
-            }
-        }
-    }
-}
-
-#if defined(USE_ITERM_RELAX)
-STATIC_UNIT_TESTED void applyItermRelax(const int axis, const float iterm,
-    const float gyroRate, float *itermErrorRate, float *currentPidSetpoint)
-{
-    const float setpointLpf = pt1FilterApply(&pidRuntime.windupLpf[axis], *currentPidSetpoint);
-    const float setpointHpf = fabsf(*currentPidSetpoint - setpointLpf);
-
-    if (pidRuntime.itermRelax) {
-        if (axis < FD_YAW || pidRuntime.itermRelax == ITERM_RELAX_RPY || pidRuntime.itermRelax == ITERM_RELAX_RPY_INC) {
-            float itermRelaxThreshold = ITERM_RELAX_SETPOINT_THRESHOLD;
-            if (FLIGHT_MODE(ANGLE_MODE)) {
-                itermRelaxThreshold *= 0.2f;
-            }
-            const float itermRelaxFactor = MAX(0, 1 - setpointHpf / itermRelaxThreshold);
-            const bool isDecreasingI =
-                ((iterm > 0) && (*itermErrorRate < 0)) || ((iterm < 0) && (*itermErrorRate > 0));
-            if ((pidRuntime.itermRelax >= ITERM_RELAX_RP_INC) && isDecreasingI) {
-                // Do Nothing, use the precalculed itermErrorRate
-            } else if (pidRuntime.itermRelaxType == ITERM_RELAX_SETPOINT) {
-                *itermErrorRate *= itermRelaxFactor;
-            } else if (pidRuntime.itermRelaxType == ITERM_RELAX_GYRO ) {
-                *itermErrorRate = fapplyDeadband(setpointLpf - gyroRate, setpointHpf);
-            } else {
-                *itermErrorRate = 0.0f;
-            }
-
-            if (axis == FD_ROLL) {
-                DEBUG_SET(DEBUG_ITERM_RELAX, 0, lrintf(setpointHpf));
-                DEBUG_SET(DEBUG_ITERM_RELAX, 1, lrintf(itermRelaxFactor * 100.0f));
-                DEBUG_SET(DEBUG_ITERM_RELAX, 2, lrintf(*itermErrorRate));
-            }
-        }
-    }
-}
-#endif
 
 static FAST_CODE_NOINLINE void disarmOnImpact(void)
 {
@@ -950,113 +913,36 @@ static FAST_CODE_NOINLINE float applyLaunchControl(int axis, const rollAndPitchT
 }
 #endif
 
-static float getTpaFactor(const pidProfile_t *pidProfile, int axis, term_e term)
-{
-    float tpaFactor = pidRuntime.tpaFactor;
-
-#ifdef USE_WING
-    if (axis == FD_YAW) {
-        tpaFactor = pidRuntime.tpaFactorYaw;
-    }
-#else
-    UNUSED(axis);
-#endif
-
-    const bool tpaActive = isTpaActive(pidProfile->tpa_mode, term);
-    switch (term) {
-    case TERM_P:
-        return tpaActive ? tpaFactor : 1.0f;
-    case TERM_D:
-        return tpaFactor;
-#ifdef USE_WING
-    case TERM_S:
-        return tpaActive ? pidRuntime.tpaFactorSterm[axis] : 1.0f;
-#endif
-    default:
-        return 1.0f;
-    }
-}
-
-static float getSterm(int axis, const pidProfile_t *pidProfile, float setpoint)
-{
-#ifdef USE_WING
-    float sTerm = setpoint / getMaxRcRate(axis) * 1000.0f *
-        (float)pidProfile->pid[axis].S * S_TERM_SCALE;
-
-    DEBUG_SET(DEBUG_S_TERM, 2 * axis, lrintf(sTerm));
-    sTerm *= getTpaFactor(pidProfile, axis, TERM_S);
-    DEBUG_SET(DEBUG_S_TERM, 2 * axis + 1, lrintf(sTerm));
-
-    return sTerm;
-#else
-    UNUSED(axis);
-    UNUSED(pidProfile);
-    UNUSED(setpoint);
-    return 0.0f;
-#endif
-}
-
-NOINLINE static void calculateSpaValues(const pidProfile_t *pidProfile)
-{
-#ifdef USE_WING
-    for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
-        float currentRate = getSetpointRate(axis);
-        pidRuntime.spa[axis] = 1.0f - smoothStepUpTransition(
-            fabsf(currentRate), pidProfile->spa_center[axis], pidProfile->spa_width[axis]);
-        DEBUG_SET(DEBUG_SPA, axis, lrintf(pidRuntime.spa[axis] * 1000));
-    }
-#else
-    UNUSED(pidProfile);
-#endif // USE_WING
-}
-
-NOINLINE static void applySpa(int axis, const pidProfile_t *pidProfile)
-{
-#ifdef USE_WING
-    spaMode_e mode = pidProfile->spa_mode[axis];
-
-    if (pidRuntime.axisInAngleMode[axis]) {
-        mode = SPA_MODE_OFF;
-    }
-
-    switch(mode) {
-        case SPA_MODE_PID:
-            pidData[axis].P *= pidRuntime.spa[axis];
-            pidData[axis].D *= pidRuntime.spa[axis];
-            pidData[axis].I *= pidRuntime.spa[axis];
-            break;
-        case SPA_MODE_I:
-            pidData[axis].I *= pidRuntime.spa[axis];
-            break;
-        case SPA_MODE_PD_I_FREEZE:
-            pidData[axis].P *= pidRuntime.spa[axis];
-            pidData[axis].D *= pidRuntime.spa[axis];
-            break;
-        case SPA_MODE_I_FREEZE:
-        case SPA_MODE_OFF:
-        default:
-            break;
-    }
-#else
-    UNUSED(axis);
-    UNUSED(pidProfile);
-#endif // USE_WING
-}
-
-// Betaflight pid controller, which will be maintained in the future with additional features specialised for current (mini) multirotor usage.
-// Based on 2DOF reference design (matlab)
+// St4rpony primary flight controller: outer-loop attitude/safety shaping + inner-loop LADRC
 void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTimeUs)
 {
-    static float previousGyroRateDterm[XYZ_AXIS_COUNT];
-    static float previousRawGyroRateDterm[XYZ_AXIS_COUNT];
-
-    calculateSpaValues(pidProfile);
+    static float previousGyroRateCrash[XYZ_AXIS_COUNT];
 
 #ifdef USE_YAW_SPIN_RECOVERY
     const bool yawSpinActive = gyroYawSpinDetected();
 #endif
 
     const bool launchControlActive = isLaunchControlActive();
+    UNUSED(launchControlActive);
+
+#ifdef USE_COMPANION_LINK
+    const bool companionOffboard = companionLinkIsOffboardActive();
+    const uint8_t companionMode = companionOffboard ? companionLinkGetSetpoint()->mode : COMPANION_MODE_NONE;
+    const bool companionOffboardRate = companionOffboard && (companionMode == COMPANION_MODE_RATE_THRUST);
+    const bool companionOffboardAttitude = companionOffboard && (companionMode == COMPANION_MODE_ATTITUDE_THRUST);
+    const bool companionLevelHold = companionLinkIsLevelHoldActive()
+        || (companionLinkShouldTriggerRth() && !FLIGHT_MODE(GPS_RESCUE_MODE));
+    const bool companionControlsFlight = companionOffboard || companionLevelHold;
+#else
+    const bool companionOffboardRate = false;
+    const bool companionOffboardAttitude = false;
+    const bool companionLevelHold = false;
+    const bool companionControlsFlight = false;
+#endif
+    UNUSED(companionOffboardRate);
+    UNUSED(companionOffboardAttitude);
+    UNUSED(companionLevelHold);
+    UNUSED(companionControlsFlight);
 
 #if defined(USE_ACC)
     static timeUs_t levelModeStartTimeUs = 0;
@@ -1065,30 +951,32 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
     float horizonLevelStrength = 0.0f;
 
     const bool isExternalAngleModeRequest = FLIGHT_MODE(GPS_RESCUE_MODE)
+                || companionOffboardAttitude
+                || companionLevelHold
 #ifdef USE_ALTITUDE_HOLD
-                || FLIGHT_MODE(ALT_HOLD_MODE) // todo - check if this is needed
+                || FLIGHT_MODE(ALT_HOLD_MODE)
 #endif
 #ifdef USE_POSITION_HOLD
                 || FLIGHT_MODE(POS_HOLD_MODE)
 #endif
                 ;
     levelMode_e levelMode;
-    if (FLIGHT_MODE(ANGLE_MODE | HORIZON_MODE | GPS_RESCUE_MODE)) {
+    if (companionOffboardRate) {
+        levelMode = LEVEL_MODE_OFF;
+        levelModeStartTimeUs = 0;
+    } else if (((companionOffboardAttitude || companionLevelHold) && sensors(SENSOR_ACC))
+        || FLIGHT_MODE(ANGLE_MODE | HORIZON_MODE | GPS_RESCUE_MODE)) {
         if (pidRuntime.levelRaceMode && !isExternalAngleModeRequest) {
             levelMode = LEVEL_MODE_R;
         } else {
             levelMode = LEVEL_MODE_RP;
         }
 
-        // Keep track of when we entered a self-level mode so that we can
-        // add a guard time before crash recovery can activate.
-        // Also reset the guard time whenever GPS Rescue is activated.
         if ((levelModeStartTimeUs == 0) || (isExternalAngleModeRequest && !prevExternalAngleRequest)) {
             levelModeStartTimeUs = currentTimeUs;
         }
 
-        // Calc horizonLevelStrength if needed
-        if (FLIGHT_MODE(HORIZON_MODE)) {
+        if (!isExternalAngleModeRequest && !FLIGHT_MODE(ANGLE_MODE) && FLIGHT_MODE(HORIZON_MODE)) {
             horizonLevelStrength = calcHorizonLevelStrength();
         }
     } else {
@@ -1102,87 +990,44 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
     UNUSED(currentTimeUs);
 #endif
 
-    // Anti Gravity
-    if (pidRuntime.antiGravityEnabled) {
-        pidRuntime.antiGravityThrottleD *= pidRuntime.antiGravityGain;
-        // used later to increase pTerm
-        pidRuntime.itermAccelerator = pidRuntime.antiGravityThrottleD * ANTIGRAVITY_KI;
-    } else {
-        pidRuntime.antiGravityThrottleD = 0.0f;
-        pidRuntime.itermAccelerator = 0.0f;
-    }
-    DEBUG_SET(DEBUG_ANTI_GRAVITY, 2, lrintf((1 + (pidRuntime.itermAccelerator / pidRuntime.pidCoefficient[FD_PITCH].Ki)) * 1000));
-    // amount of antigravity added relative to user's pitch iTerm coefficient
-    // used later to increase iTerm
-
-    // Precalculate gyro delta for D-term here, this allows loop unrolling
-    float gyroRateDterm[XYZ_AXIS_COUNT];
-    for (int axis = FD_ROLL; axis <= FD_YAW; ++axis) {
-        gyroRateDterm[axis] = gyro.gyroADCf[axis];
-
-        // Log the unfiltered D for ROLL and PITCH
-        if (debugMode == DEBUG_D_LPF && axis != FD_YAW) {
-            const float delta = (previousRawGyroRateDterm[axis] - gyroRateDterm[axis]) * pidRuntime.pidFrequency / D_LPF_RAW_SCALE;
-            previousRawGyroRateDterm[axis] = gyroRateDterm[axis];
-            DEBUG_SET(DEBUG_D_LPF, axis, lrintf(delta)); // debug d_lpf 2 and 3 used for pre-TPA D
-        }
-
-        gyroRateDterm[axis] = pidRuntime.dtermNotchApplyFn((filter_t *) &pidRuntime.dtermNotch[axis], gyroRateDterm[axis]);
-        gyroRateDterm[axis] = pidRuntime.dtermLowpassApplyFn((filter_t *) &pidRuntime.dtermLowpass[axis], gyroRateDterm[axis]);
-        gyroRateDterm[axis] = pidRuntime.dtermLowpass2ApplyFn((filter_t *) &pidRuntime.dtermLowpass2[axis], gyroRateDterm[axis]);
-    }
-
-    rotateItermAndAxisError();
-
     if (pidRuntime.useEzDisarm) {
         disarmOnImpact();
     }
 
 #ifdef USE_CHIRP
-
     static int chirpAxis = 0;
     static bool shouldChirpAxisToggle = false;
 
     float chirp = 0.0f;
     float sinarg = 0.0f;
     if (FLIGHT_MODE(CHIRP_MODE)) {
-        shouldChirpAxisToggle = true;  // advance chirp axis on next !CHIRP_MODE
-        // update chirp signal
+        shouldChirpAxisToggle = true;
         if (chirpUpdate(&pidRuntime.chirp)) {
             chirp = pidRuntime.chirp.exc;
             sinarg = pidRuntime.chirp.sinarg;
         }
     } else {
         if (shouldChirpAxisToggle) {
-            // toggle chirp signal logic and increment to next axis for next run
             shouldChirpAxisToggle = false;
             chirpAxis = (++chirpAxis > FD_YAW) ? 0 : chirpAxis;
-            // reset chirp signal generator
             chirpReset(&pidRuntime.chirp);
         }
     }
 
-    // input / excitation shaping
-    float chirpFiltered  = phaseCompApply(&pidRuntime.chirpFilter, chirp);
-
-    // debug channels for offline system identification / autotune analysis
-    // 0: sinarg phase (0…2π scaled to ±32k) — enables offline chirp signal reconstruction
-    // 1: active chirp axis (0 = roll, 1 = pitch, 2 = yaw, -1 = inactive)
-    // 2: instantaneous chirp frequency in deci-Hz — maps time to frequency for spectral analysis
-    // 3: raw chirp excitation × 1000 (before phase comp filter) — reference signal for cross-correlation
+    float chirpFiltered = phaseCompApply(&pidRuntime.chirpFilter, chirp);
     DEBUG_SET(DEBUG_CHIRP, 0, lrintf(5.0e3f * sinarg));
     DEBUG_SET(DEBUG_CHIRP, 1, FLIGHT_MODE(CHIRP_MODE) ? chirpAxis : -1);
     DEBUG_SET(DEBUG_CHIRP, 2, lrintf(10.0f * pidRuntime.chirp.fchirp));
     DEBUG_SET(DEBUG_CHIRP, 3, lrintf(1.0e3f * chirp));
-
 #endif // USE_CHIRP
 
-    // ----------PID controller----------
-    for (flight_dynamics_index_t axis = FD_ROLL; axis <= FD_YAW; ++axis) {
+    const float ladrcB0Scale = ladrcGetExternalB0Scale();
 
+    // ---------- LADRC inner-loop controller ----------
+    for (flight_dynamics_index_t axis = FD_ROLL; axis <= FD_YAW; ++axis) {
 #ifdef USE_CHIRP
         float currentChirp = 0.0f;
-        if(axis == chirpAxis){
+        if (axis == chirpAxis) {
             currentChirp = pidRuntime.chirpAmplitude[axis] * chirpFiltered;
         }
 #endif // USE_CHIRP
@@ -1191,8 +1036,7 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
         if (pidRuntime.maxVelocity[axis]) {
             currentPidSetpoint = accelerationLimit(axis, currentPidSetpoint);
         }
-        // Yaw control is GYRO based, direct sticks control is applied to rate PID
-        // When Race Mode is active PITCH control is also GYRO based in level or horizon mode
+
 #if defined(USE_ACC)
         pidRuntime.axisInAngleMode[axis] = false;
         if (axis < FD_YAW) {
@@ -1200,35 +1044,32 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
                 pidRuntime.axisInAngleMode[axis] = true;
                 currentPidSetpoint = pidLevel(axis, pidProfile, angleTrim, currentPidSetpoint, horizonLevelStrength);
             }
-        } else { // yaw axis only
+        } else {
             if (levelMode == LEVEL_MODE_RP) {
-                // if earth referencing is requested, attenuate yaw axis setpoint when pitched or rolled
-                // and send yawSetpoint to Angle code to modulate pitch and roll
-                // code cost is 107 cycles when earthRef enabled, 20 otherwise, nearly all in cos_approx
                 const float earthRefGain = FLIGHT_MODE(GPS_RESCUE_MODE) ? 1.0f : pidRuntime.angleEarthRef;
                 if (earthRefGain) {
                     pidRuntime.angleYawSetpoint = currentPidSetpoint;
-                    float maxAngleTargetAbs = earthRefGain * fmaxf( fabsf(pidRuntime.angleTarget[FD_ROLL]), fabsf(pidRuntime.angleTarget[FD_PITCH]) );
+                    float maxAngleTargetAbs = earthRefGain * fmaxf(fabsf(pidRuntime.angleTarget[FD_ROLL]), fabsf(pidRuntime.angleTarget[FD_PITCH]));
                     maxAngleTargetAbs *= (FLIGHT_MODE(HORIZON_MODE)) ? horizonLevelStrength : 1.0f;
-                    // reduce compensation whenever Horizon uses less levelling
                     currentPidSetpoint *= cos_approx(DEGREES_TO_RADIANS(maxAngleTargetAbs));
-                    DEBUG_SET(DEBUG_ANGLE_TARGET, 2, currentPidSetpoint); // yaw setpoint after attenuation
+                    DEBUG_SET(DEBUG_ANGLE_TARGET, 2, currentPidSetpoint);
                 }
             }
         }
 #endif
 
-        const float currentPidSetpointBeforeWingAdjust = currentPidSetpoint;
+        bool resetDisturbance = false;
+
         currentPidSetpoint = wingAdjustSetpoint(currentPidSetpoint, axis);
 
 #ifdef USE_ACRO_TRAINER
-        if ((axis != FD_YAW) && pidRuntime.acroTrainerActive && !pidRuntime.inCrashRecoveryMode && !launchControlActive) {
-            currentPidSetpoint = applyAcroTrainer(axis, angleTrim, currentPidSetpoint);
+        if ((axis != FD_YAW) && pidRuntime.acroTrainerActive && !pidRuntime.inCrashRecoveryMode && !launchControlActive && !companionControlsFlight) {
+            currentPidSetpoint = applyAcroTrainer(axis, angleTrim, currentPidSetpoint, &resetDisturbance);
         }
 #endif // USE_ACRO_TRAINER
 
 #ifdef USE_LAUNCH_CONTROL
-        if (launchControlActive) {
+        if (launchControlActive && !companionControlsFlight) {
 #if defined(USE_ACC)
             currentPidSetpoint = applyLaunchControl(axis, angleTrim);
 #else
@@ -1237,224 +1078,94 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
         }
 #endif
 
-        // Handle yaw spin recovery - zero the setpoint on yaw to aid in recovery
-        // It's not necessary to zero the set points for R/P because the PIDs will be zeroed below
 #ifdef USE_YAW_SPIN_RECOVERY
-        if ((axis == FD_YAW) && yawSpinActive) {
-            currentPidSetpoint = 0.0f;
+        if (yawSpinActive) {
+            if (axis == FD_YAW) {
+                currentPidSetpoint = 0.0f;
+                resetDisturbance = true;
+            } else {
+                ladrcResetAxisState(axis);
+                pidData[axis].P = 0.0f;
+                pidData[axis].I = 0.0f;
+                pidData[axis].D = 0.0f;
+                pidData[axis].F = 0.0f;
+                pidData[axis].S = 0.0f;
+                pidData[axis].Sum = 0.0f;
+                continue;
+            }
         }
 #endif // USE_YAW_SPIN_RECOVERY
 
-        // -----calculate error rate
-        const float gyroRate = gyro.gyroADCf[axis]; // Process variable from gyro output in deg/sec
+        const float gyroRate = gyro.gyroADCf[axis];
 #ifdef USE_CHIRP
         currentPidSetpoint += currentChirp;
 #endif // USE_CHIRP
-        float errorRate = currentPidSetpoint - gyroRate; // r - y
+        float errorRate = currentPidSetpoint - gyroRate;
+
 #if defined(USE_ACC)
-        handleCrashRecovery(
-            pidProfile->crash_recovery, angleTrim, axis, currentTimeUs, gyroRate,
-            &currentPidSetpoint, &errorRate);
-#endif
-
-        const float previousIterm = pidData[axis].I;
-        float itermErrorRate = errorRate;
-
-#if defined(USE_ITERM_RELAX)
-        if (!launchControlActive && !pidRuntime.inCrashRecoveryMode) {
-            applyItermRelax(axis, previousIterm, gyroRate, &itermErrorRate, &currentPidSetpoint);
-            errorRate = currentPidSetpoint - gyroRate;
-        }
-#endif
-
-        // --------low-level gyro-based PID based on 2DOF PID controller. ----------
-
-        // -----calculate P component
-        pidData[axis].P = pidRuntime.pidCoefficient[axis].Kp * errorRate * getTpaFactor(pidProfile, axis, TERM_P);
-        if (axis == FD_YAW) {
-            pidData[axis].P = pidRuntime.ptermYawLowpassApplyFn((filter_t *) &pidRuntime.ptermYawLowpass, pidData[axis].P);
-        }
-
-        // -----calculate I component
-        float Ki = pidRuntime.pidCoefficient[axis].Ki;
-        float itermLimit = pidRuntime.itermLimit; // windup fraction of pidSumLimit
-
-#ifdef USE_LAUNCH_CONTROL
-        // if launch control is active override the iterm gains and apply iterm windup protection to all axes
-        if (launchControlActive) {
-            Ki = pidRuntime.launchControlKi;
-        } else
-#endif
-        {
-            // yaw iTerm has it's own limit based on pidSumLimitYaw
-            if (axis == FD_YAW) {
-                itermLimit = pidRuntime.itermLimitYaw; // windup fraction of pidSumLimitYaw
-                // note that this is a stronger limit than previously
-                pidRuntime.itermAccelerator = 0.0f; // no antigravity on yaw iTerm
+        if (!ARMING_FLAG(ARMED)) {
+            if (pidRuntime.inCrashRecoveryMode) {
+                pidRuntime.inCrashRecoveryMode = false;
+                BEEP_OFF;
             }
-        }
-
-        float iTermChange = (Ki + pidRuntime.itermAccelerator) * pidRuntime.dT * itermErrorRate;
-#ifdef USE_WING
-        if (pidProfile->spa_mode[axis] != SPA_MODE_OFF) {
-            // slowing down I-term change, or even making it zero if setpoint is high enough
-            iTermChange *= pidRuntime.spa[axis];
-        }
-#endif // USE_WING
-
-        pidData[axis].I = constrainf(previousIterm + iTermChange, -itermLimit, itermLimit);
-
-        // -----calculate D component
-
-        float pidSetpointDelta = 0;
-
-#if defined(USE_FEEDFORWARD) && defined(USE_ACC)
-        if (FLIGHT_MODE(ANGLE_MODE) && pidRuntime.axisInAngleMode[axis]) {
-            // this axis is fully under self-levelling control
-            // it will already have stick based feedforward applied in the input to their angle setpoint
-            // a simple setpoint Delta can be used to for PID feedforward element for motor lag on these axes
-            // however RC steps come in, via angle setpoint
-            // and setpoint RC smoothing must have a cutoff half normal to remove those steps completely
-            // the RC stepping does not come in via the feedforward, which is very well smoothed already
-            // if uncommented, and the forcing to zero is removed, the two following lines will restore PID feedforward to angle mode axes
-            // but for now let's see how we go without it (which was the case before 4.5 anyway)
-//            pidSetpointDelta = currentPidSetpoint - pidRuntime.previousPidSetpoint[axis];
-//            pidSetpointDelta *= pidRuntime.pidFrequency * pidRuntime.angleFeedforwardGain;
-            pidSetpointDelta = 0.0f;
         } else {
-            // the axis is operating as a normal acro axis, so use normal feedforard from rc.c
-            pidSetpointDelta = getFeedforward(axis);
-        }
-#endif
-        pidRuntime.previousPidSetpoint[axis] = currentPidSetpoint; // this is the value sent to blackbox, and used for D-max setpoint
+            handleCrashRecovery(
+                pidProfile->crash_recovery, angleTrim, axis, currentTimeUs, gyroRate,
+                &currentPidSetpoint, &errorRate, &resetDisturbance);
 
-        // disable D if launch control is active
-        if ((pidRuntime.pidCoefficient[axis].Kd > 0) && !launchControlActive) {
-            // Divide rate change by dT to get differential (ie dr/dt).
-            // dT is fixed and calculated from the target PID loop time
-            // This is done to avoid DTerm spikes that occur with dynamically
-            // calculated deltaT whenever another task causes the PID
-            // loop execution to be delayed.
-            const float delta = - (gyroRateDterm[axis] - previousGyroRateDterm[axis]) * pidRuntime.pidFrequency;
-            float preTpaD = pidRuntime.pidCoefficient[axis].Kd * delta;
-
-#if defined(USE_ACC)
+            const float gyroDelta = -(gyroRate - previousGyroRateCrash[axis]) * pidRuntime.pidFrequency;
             if (cmpTimeUs(currentTimeUs, levelModeStartTimeUs) > CRASH_RECOVERY_DETECTION_DELAY_US) {
-                detectAndSetCrashRecovery(pidProfile->crash_recovery, axis, currentTimeUs, delta, errorRate);
-            }
-#endif
-
-#ifdef USE_D_MAX
-            float dMaxMultiplier = 1.0f;
-            if (pidRuntime.dMaxPercent[axis] > 1.0f) {
-                float dMaxGyroFactor = pt2FilterApply(&pidRuntime.dMaxRange[axis], delta);
-                dMaxGyroFactor = fabsf(dMaxGyroFactor) * pidRuntime.dMaxGyroGain;
-                const float dMaxSetpointFactor = fabsf(pidSetpointDelta) * pidRuntime.dMaxSetpointGain;
-                const float dMaxBoost = fmaxf(dMaxGyroFactor, dMaxSetpointFactor);
-                // dMaxBoost starts at zero, and by 1.0 we get Dmax, but it can exceed 1.
-                dMaxMultiplier += (pidRuntime.dMaxPercent[axis] - 1.0f) * dMaxBoost;
-                dMaxMultiplier = pt2FilterApply(&pidRuntime.dMaxLowpass[axis], dMaxMultiplier);
-                // limit the gain to the fraction that DMax is greater than Min
-                dMaxMultiplier = MIN(dMaxMultiplier, pidRuntime.dMaxPercent[axis]);
-                if (debugMode == DEBUG_D_MAX && (int)axis == gyro.gyroDebugAxis) {
-                    DEBUG_SET(DEBUG_D_MAX, 0, lrintf(dMaxGyroFactor * 100));
-                    DEBUG_SET(DEBUG_D_MAX, 1, lrintf(dMaxSetpointFactor * 100));
-                    DEBUG_SET(DEBUG_D_MAX, 2, lrintf(pidRuntime.pidCoefficient[axis].Kd * dMaxMultiplier * 10 / DTERM_SCALE)); // effective Kd after Dmax boost
-                    DEBUG_SET(DEBUG_D_MAX, 3, lrintf(dMaxMultiplier * 100));
-                }
-            }
-
-            // Apply the gain that increases D towards Dmax
-            preTpaD *= dMaxMultiplier;
-#endif
-
-            pidData[axis].D = preTpaD * getTpaFactor(pidProfile, axis, TERM_D);
-
-            // Log the value of D pre application of TPA
-            if (axis != FD_YAW) {
-                DEBUG_SET(DEBUG_D_LPF, axis - FD_ROLL + 2, lrintf(preTpaD * D_LPF_PRE_TPA_SCALE));
-            }
-        } else {
-            pidData[axis].D = 0;
-            if (axis != FD_YAW) {
-                DEBUG_SET(DEBUG_D_LPF, axis - FD_ROLL + 2, 0);
+                detectAndSetCrashRecovery(pidProfile->crash_recovery, axis, currentTimeUs, gyroDelta, errorRate);
             }
         }
+#endif
+        previousGyroRateCrash[axis] = gyroRate;
 
-        previousGyroRateDterm[axis] = gyroRateDterm[axis];
+        pidRuntime.previousPidSetpoint[axis] = currentPidSetpoint;
 
-        // -----calculate feedforward component
-        // no feedforward in launch control
-        const float feedforwardGain = launchControlActive ? 0.0f : pidRuntime.pidCoefficient[axis].Kf;
-        pidData[axis].F = feedforwardGain * pidSetpointDelta;
-
-#ifdef USE_YAW_SPIN_RECOVERY
-        if (yawSpinActive) {
-            pidData[axis].I = 0;  // in yaw spin always disable I
-            if (axis <= FD_PITCH)  {
-                // zero PIDs on pitch and roll leaving yaw P to correct spin
-                pidData[axis].P = 0;
-                pidData[axis].D = 0;
-                pidData[axis].F = 0;
-                pidData[axis].S = 0;
-            }
-        }
-#endif // USE_YAW_SPIN_RECOVERY
-
-#ifdef USE_LAUNCH_CONTROL
-        // Disable P/I appropriately based on the launch control mode
-        if (launchControlActive) {
-            // if not using FULL mode then disable I accumulation on yaw as
-            // yaw has a tendency to windup. Otherwise limit yaw iterm accumulation.
-            const int launchControlYawItermLimit = (pidRuntime.launchControlMode == LAUNCH_CONTROL_MODE_FULL) ? LAUNCH_CONTROL_YAW_ITERM_LIMIT : 0;
-            pidData[FD_YAW].I = constrainf(pidData[FD_YAW].I, -launchControlYawItermLimit, launchControlYawItermLimit);
-
-            // for pitch-only mode we disable everything except pitch P/I
-            if (pidRuntime.launchControlMode == LAUNCH_CONTROL_MODE_PITCHONLY) {
-                pidData[FD_ROLL].P = 0;
-                pidData[FD_ROLL].I = 0;
-                pidData[FD_YAW].P = 0;
-                // don't let I go negative (pitch backwards) as front motors are limited in the mixer
-                pidData[FD_PITCH].I = MAX(0.0f, pidData[FD_PITCH].I);
+        // Avoid double-filtering / 2nd-order TD phase lag inside closed-loop outer attitude controllers or crash recovery
+        float tdWeight = 1.0f;
+#if defined(USE_ACC)
+        if (pidRuntime.inCrashRecoveryMode) {
+            tdWeight = 0.0f;
+        } else if (pidRuntime.axisInAngleMode[axis]) {
+            if (FLIGHT_MODE(ANGLE_MODE | GPS_RESCUE_MODE | POS_HOLD_MODE | ALT_HOLD_MODE)
+                || companionOffboardAttitude
+                || companionLevelHold) {
+                tdWeight = 0.0f;
+            } else {
+                tdWeight = 1.0f - constrainf(horizonLevelStrength * 4.0f, 0.0f, 1.0f);
             }
         }
 #endif
 
-        // Add P boost from antiGravity when sticks are close to zero
-        if (axis != FD_YAW) {
-            float agSetpointAttenuator = fabsf(currentPidSetpoint) / 50.0f;
-            agSetpointAttenuator = MAX(agSetpointAttenuator, 1.0f);
-            // attenuate effect if turning more than 50 deg/s, half at 100 deg/s
-            const float antiGravityPBoost = 1.0f + (pidRuntime.antiGravityThrottleD / agSetpointAttenuator) * pidRuntime.antiGravityPGain;
-            pidData[axis].P *= antiGravityPBoost;
-            if (axis == FD_PITCH) {
-                DEBUG_SET(DEBUG_ANTI_GRAVITY, 3, lrintf(antiGravityPBoost * 1000));
-            }
+        ladrcResetMode_e ladrcResetMode = LADRC_RESET_NONE;
+        if (pidRuntime.zeroThrottleItermReset && !wasThrottleRaised()) {
+            ladrcResetMode = LADRC_RESET_OBSERVER_FULL;
+        } else if (pidRuntime.zeroThrottleItermReset || resetDisturbance) {
+            ladrcResetMode = LADRC_RESET_DISTURBANCE;
         }
 
-        pidData[axis].S = getSterm(axis, pidProfile, currentPidSetpointBeforeWingAdjust);
-        applySpa(axis, pidProfile);
-
-        // calculating the PID sum
-        const float pidSum = pidData[axis].P + pidData[axis].I + pidData[axis].D + pidData[axis].F + pidData[axis].S;
-#ifdef USE_INTEGRATED_YAW_CONTROL
-        if (axis == FD_YAW && pidRuntime.useIntegratedYaw) {
-            pidData[axis].Sum += pidSum * pidRuntime.dT * 100.0f;
-            pidData[axis].Sum -= pidData[axis].Sum * pidRuntime.integratedYawRelax / 100000.0f * pidRuntime.dT / 0.000125f;
-        } else
-#endif
-        {
-            pidData[axis].Sum = pidSum;
-        }
+        const float sumLimit = (axis == FD_YAW) ? pidProfile->pidSumLimitYaw : pidProfile->pidSumLimit;
+        pidData[axis].S = 0.0f;
+        pidData[axis].Sum = ladrcStepAxisEx(
+            axis,
+            currentPidSetpoint,
+            gyroRate,
+            sumLimit,
+            ladrcB0Scale,
+            tdWeight,
+            ladrcResetMode,
+            &pidData[axis].P,
+            &pidData[axis].D,
+            &pidData[axis].F,
+            &pidData[axis].I
+        );
     }
 
 #ifdef USE_WING
-    // When PASSTHRU_MODE is active - reset all PIDs to zero so the aircraft won't snap out of control
-    // because of accumulated PIDs once PASSTHRU_MODE gets disabled.
     bool isFixedWingAndPassthru = isFixedWing() && FLIGHT_MODE(PASSTHRU_MODE);
 #endif // USE_WING
-    // Disable PID control if at zero throttle or if gyro overflow detected
-    // This may look very innefficient, but it is done on purpose to always show real CPU usage as in flight
     if (!pidRuntime.pidStabilisationEnabled
         || gyroOverflowDetected()
 #ifdef USE_WING
@@ -1467,11 +1178,9 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
             pidData[axis].D = 0;
             pidData[axis].F = 0;
             pidData[axis].S = 0;
-
             pidData[axis].Sum = 0;
         }
-    } else if (pidRuntime.zeroThrottleItermReset) {
-        pidResetIterm();
+        ladrcResetState();
     }
 }
 

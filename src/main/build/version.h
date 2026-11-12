@@ -22,8 +22,8 @@
 
 #include "common/utils.h"
 
-#define FC_FIRMWARE_NAME            "Betaflight"
-#define FC_FIRMWARE_IDENTIFIER      "BTFL"
+#define FC_FIRMWARE_NAME            "St4rpony"
+#define FC_FIRMWARE_IDENTIFIER      "ST4R"
 
 #define FC_CALVER_BASE_YEAR 2000
 

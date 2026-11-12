@@ -100,6 +100,8 @@ typedef struct sdcard_t {
 #endif
 
     uint8_t dmaChannel;
+    uint32_t writeErrorCount;
+    sdcardDiagStats_t diag;
 } sdcard_t;
 
 extern sdcard_t sdcard;

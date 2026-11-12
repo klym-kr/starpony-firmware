@@ -494,12 +494,9 @@ static int8_t SCSI_Read10(USBD_HandleTypeDef  *pdev, uint8_t lun , uint8_t *para
       return -1; /* error */
     }
     
-    hmsc->bot_state = USBD_BOT_DATA_IN;
-    hmsc->scsi_blk_addr *= hmsc->scsi_blk_size;
-    hmsc->scsi_blk_len  *= hmsc->scsi_blk_size;
-    
+    /* Keep LBA and transfer length in blocks to avoid 32-bit byte-offset wrap at >= 4 GiB */
     /* cases 4,5 : Hi <> Dn */
-    if (hmsc->cbw.dDataLength != hmsc->scsi_blk_len)
+    if (hmsc->cbw.dDataLength != (hmsc->scsi_blk_len * hmsc->scsi_blk_size))
     {
       SCSI_SenseCode(pdev,
                      hmsc->cbw.bLUN, 
@@ -507,6 +504,7 @@ static int8_t SCSI_Read10(USBD_HandleTypeDef  *pdev, uint8_t lun , uint8_t *para
                      INVALID_CDB);
       return -1;
     }
+    hmsc->bot_state = USBD_BOT_DATA_IN;
   }
   hmsc->bot_data_length = MSC_MEDIA_PACKET;  
   
@@ -576,11 +574,11 @@ static int8_t SCSI_Write10 (USBD_HandleTypeDef  *pdev, uint8_t lun , uint8_t *pa
       return -1; /* error */      
     }
     
-    hmsc->scsi_blk_addr *= hmsc->scsi_blk_size;
-    hmsc->scsi_blk_len  *= hmsc->scsi_blk_size;
+    /* Keep LBA and transfer length in blocks to avoid 32-bit byte-offset wrap at >= 4 GiB */
+    uint32_t len = hmsc->scsi_blk_len * hmsc->scsi_blk_size;
     
     /* cases 3,11,13 : Hn,Ho <> D0 */
-    if (hmsc->cbw.dDataLength != hmsc->scsi_blk_len)
+    if (hmsc->cbw.dDataLength != len)
     {
       SCSI_SenseCode(pdev,
                      hmsc->cbw.bLUN, 
@@ -589,12 +587,14 @@ static int8_t SCSI_Write10 (USBD_HandleTypeDef  *pdev, uint8_t lun , uint8_t *pa
       return -1;
     }
     
+    len = MIN(len, MSC_MEDIA_PACKET);
+
     /* Prepare EP to receive first data packet */
     hmsc->bot_state = USBD_BOT_DATA_OUT;  
     USBD_LL_PrepareReceive (pdev,
                       MSC_EPOUT_ADDR,
                       hmsc->bot_data, 
-                      MIN (hmsc->scsi_blk_len, MSC_MEDIA_PACKET));  
+                      len);  
   }
   else /* Write Process ongoing */
   {
@@ -648,7 +648,7 @@ static int8_t SCSI_CheckAddressRange (USBD_HandleTypeDef  *pdev, uint8_t lun , u
 {
   USBD_MSC_BOT_HandleTypeDef  *hmsc = (USBD_MSC_BOT_HandleTypeDef*) pdev->pClassData; 
   
-  if ((blk_offset + blk_nbr) > hmsc->scsi_blk_nbr )
+  if ((blk_offset > hmsc->scsi_blk_nbr) || (blk_nbr > (hmsc->scsi_blk_nbr - blk_offset)))
   {
     SCSI_SenseCode(pdev,
                    lun, 
@@ -670,12 +670,13 @@ static int8_t SCSI_ProcessRead (USBD_HandleTypeDef  *pdev, uint8_t lun)
   USBD_MSC_BOT_HandleTypeDef  *hmsc = (USBD_MSC_BOT_HandleTypeDef*)pdev->pClassData;   
   uint32_t len;
   
-  len = MIN(hmsc->scsi_blk_len , MSC_MEDIA_PACKET); 
+  len = MIN(hmsc->scsi_blk_len * hmsc->scsi_blk_size, MSC_MEDIA_PACKET);
+  uint32_t blkNbr = len / hmsc->scsi_blk_size;
   
   if( ((USBD_StorageTypeDef *)pdev->pUserData)->Read(lun ,
                               hmsc->bot_data, 
-                              hmsc->scsi_blk_addr / hmsc->scsi_blk_size, 
-                              len / hmsc->scsi_blk_size) < 0)
+                              hmsc->scsi_blk_addr, 
+                              blkNbr) < 0)
   {
     
     SCSI_SenseCode(pdev,
@@ -692,8 +693,8 @@ static int8_t SCSI_ProcessRead (USBD_HandleTypeDef  *pdev, uint8_t lun)
              len);
   
   
-  hmsc->scsi_blk_addr   += len; 
-  hmsc->scsi_blk_len    -= len;  
+  hmsc->scsi_blk_addr   += blkNbr; 
+  hmsc->scsi_blk_len    -= blkNbr;  
   
   /* case 6 : Hi = Di */
   hmsc->csw.dDataResidue -= len;
@@ -717,12 +718,13 @@ static int8_t SCSI_ProcessWrite (USBD_HandleTypeDef  *pdev, uint8_t lun)
   uint32_t len;
   USBD_MSC_BOT_HandleTypeDef  *hmsc = (USBD_MSC_BOT_HandleTypeDef*) pdev->pClassData; 
   
-  len = MIN(hmsc->scsi_blk_len , MSC_MEDIA_PACKET); 
+  len = MIN(hmsc->scsi_blk_len * hmsc->scsi_blk_size, MSC_MEDIA_PACKET);
+  uint32_t blkNbr = len / hmsc->scsi_blk_size;
   
   if(((USBD_StorageTypeDef *)pdev->pUserData)->Write(lun ,
                               hmsc->bot_data, 
-                              hmsc->scsi_blk_addr / hmsc->scsi_blk_size, 
-                              len / hmsc->scsi_blk_size) < 0)
+                              hmsc->scsi_blk_addr, 
+                              blkNbr) < 0)
   {
     SCSI_SenseCode(pdev,
                    lun, 
@@ -732,8 +734,8 @@ static int8_t SCSI_ProcessWrite (USBD_HandleTypeDef  *pdev, uint8_t lun)
   }
   
   
-  hmsc->scsi_blk_addr  += len; 
-  hmsc->scsi_blk_len   -= len; 
+  hmsc->scsi_blk_addr  += blkNbr; 
+  hmsc->scsi_blk_len   -= blkNbr; 
   
   /* case 12 : Ho = Do */
   hmsc->csw.dDataResidue -= len;
@@ -744,11 +746,12 @@ static int8_t SCSI_ProcessWrite (USBD_HandleTypeDef  *pdev, uint8_t lun)
   }
   else
   {
+    len = MIN(hmsc->scsi_blk_len * hmsc->scsi_blk_size, MSC_MEDIA_PACKET);
     /* Prepare EP to Receive next packet */
     USBD_LL_PrepareReceive (pdev,
                             MSC_EPOUT_ADDR,
                             hmsc->bot_data, 
-                            MIN (hmsc->scsi_blk_len, MSC_MEDIA_PACKET)); 
+                            len); 
   }
   
   return 0;

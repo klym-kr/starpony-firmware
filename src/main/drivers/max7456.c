@@ -39,6 +39,9 @@
 #include "drivers/nvic.h"
 #include "drivers/osd.h"
 #include "drivers/osd_symbols.h"
+#ifdef USE_SDCARD
+#include "drivers/sdcard.h"
+#endif
 #include "drivers/time.h"
 
 // 10 MHz max SPI frequency
@@ -563,6 +566,11 @@ bool max7456ReInitIfRequired(bool forceStallCheck)
     const timeMs_t nowMs = millis();
 
     bool stalled = false;
+#ifdef USE_SDCARD
+    if (!forceStallCheck && sdcard_isBusy()) {
+        return false;
+    }
+#endif
     if (forceStallCheck || (lastStallCheckMs + MAX7456_STALL_CHECK_INTERVAL_MS < nowMs)) {
         lastStallCheckMs = nowMs;
 
@@ -648,8 +656,12 @@ bool max7456DrawScreen(void)
         maxSpiBufStartIndex = useDma ? MAX_BYTES2SEND : MAX_BYTES2SEND_POLLED;
         maxEncodeTime = useDma ? MAX_ENCODE_US : MAX_ENCODE_US_POLLED;
 
-        // Abort for now if the bus is still busy
-        if (spiIsBusy(dev)) {
+        // Abort for now if the bus is still busy (including active SD card SPI transfers)
+        if (spiIsBusy(dev)
+#ifdef USE_SDCARD
+            || sdcard_isBusy()
+#endif
+        ) {
             // Not finished yet
             return true;
         }
@@ -735,8 +747,19 @@ bool max7456DrawScreen(void)
 // should not be used when armed
 void max7456RefreshAll(void)
 {
+#ifdef USE_SDCARD
+    while (sdcard_isBusy()) {
+        sdcard_poll();
+    }
+#endif
     max7456ReInitIfRequired(true);
-    while (max7456DrawScreen());
+    while (max7456DrawScreen()) {
+#ifdef USE_SDCARD
+        if (sdcard_isBusy()) {
+            sdcard_poll();
+        }
+#endif
+    }
 }
 
 bool max7456WriteNvm(uint8_t char_address, const uint8_t *font_data)

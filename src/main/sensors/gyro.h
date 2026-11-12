@@ -40,9 +40,10 @@
 #define LPF_MAX_HZ 1000 // so little filtering above 1000hz that if the user wants less delay, they must disable the filter
 #define DYN_LPF_MAX_HZ 1000
 
-#define GYRO_LPF1_DYN_MIN_HZ_DEFAULT 250
-#define GYRO_LPF1_DYN_MAX_HZ_DEFAULT 500
-#define GYRO_LPF2_HZ_DEFAULT 500
+// Tuned 10" cargo payload baseline gyro pre-filtering (safe across 7"-10"; 16"/20"+ use Configurator presets)
+#define GYRO_LPF1_DYN_MIN_HZ_DEFAULT 120
+#define GYRO_LPF1_DYN_MAX_HZ_DEFAULT 280
+#define GYRO_LPF2_HZ_DEFAULT 280
 
 #ifdef USE_YAW_SPIN_RECOVERY
 #define YAW_SPIN_RECOVERY_THRESHOLD_MIN 500

@@ -112,6 +112,7 @@
 
 #include "io/asyncfatfs/asyncfatfs.h"
 #include "io/beeper.h"
+#include "io/companion_link.h"
 #include "io/dashboard.h"
 #include "io/displayport_fb_osd.h"
 #include "io/displayport_frsky_osd.h"
@@ -738,6 +739,10 @@ void initPhase3(void)
 
     // Finally initialize the gyro filtering
     gyroInitFilters();
+
+#ifdef USE_COMPANION_LINK
+    companionLinkInit();
+#endif
 
     pidInit(currentPidProfile);
 

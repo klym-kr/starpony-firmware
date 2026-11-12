@@ -51,6 +51,10 @@
 
 #include "pg/rx.h"
 
+#ifdef USE_COMPANION_LINK
+#include "io/companion_link.h"
+#endif
+
 #include "rx/rx.h"
 
 #include "sensors/battery.h"
@@ -119,6 +123,19 @@ static float rcDeflectionSmoothed[3];
 
 float getSetpointRate(int axis)
 {
+#ifdef USE_COMPANION_LINK
+    if (companionLinkIsOffboardActive()) {
+        const companionSetpoint_t *sp = companionLinkGetSetpoint();
+        if (sp->mode == COMPANION_MODE_RATE_THRUST && axis >= 0 && axis < XYZ_AXIS_COUNT) {
+            return sp->target[axis];
+        }
+        if (sp->mode == COMPANION_MODE_ATTITUDE_THRUST && axis == FD_YAW) {
+            return sp->target[FD_YAW];
+        }
+    } else if ((companionLinkIsLevelHoldActive() || companionLinkShouldTriggerRth()) && axis == FD_YAW) {
+        return 0.0f;
+    }
+#endif
 #ifdef USE_RC_SMOOTHING_FILTER
     return rxConfig()->rc_smoothing ? setpointRate[axis] : rawSetpoint[axis];
 #else

@@ -43,8 +43,11 @@
 
 #include "drivers/flash/flash.h"
 #include "drivers/system.h"
+#include "drivers/time.h"
 
 static uint16_t eepromConfigSize;
+static uint32_t lastEepromWriteDurationMs;
+static uint32_t eepromWriteCount;
 
 typedef enum {
     CR_CLASSICATION_SYSTEM   = 0,
@@ -448,20 +451,40 @@ bool loadEEPROM(void)
     return success;
 }
 
+bool isPgDirty(const pgRegistry_t *reg)
+{
+    return *reg->fnv_hash != fnv_update(FNV_OFFSET_BASIS, reg->address, pgSize(reg));
+}
+
+uint16_t getDirtyPgCount(void)
+{
+    uint16_t dirtyCount = 0;
+    PG_FOREACH(reg) {
+        if (isPgDirty(reg)) {
+            dirtyCount++;
+        }
+    }
+    return dirtyCount;
+}
+
+uint32_t getLastEepromWriteDurationMs(void)
+{
+    return lastEepromWriteDurationMs;
+}
+
+uint32_t getEepromWriteCount(void)
+{
+    return eepromWriteCount;
+}
+
 static bool writeSettingsToEEPROM(void)
 {
-    bool dirtyConfig = !isEEPROMVersionValid() || !isEEPROMStructureValid();
+    const bool dirtyConfig = !isEEPROMVersionValid() || !isEEPROMStructureValid() || (getDirtyPgCount() > 0);
 
     configHeader_t header = {
         .eepromConfigVersion =  EEPROM_CONF_VERSION,
         .magic_be =             0xBE,
     };
-
-    PG_FOREACH(reg) {
-        if (*reg->fnv_hash != fnv_update(FNV_OFFSET_BASIS, reg->address, pgSize(reg))) {
-            dirtyConfig = true;
-        }
-    }
 
     // Only write the config if it has changed
     if (dirtyConfig) {
@@ -510,6 +533,7 @@ static bool writeSettingsToEEPROM(void)
 
 void writeConfigToEEPROM(void)
 {
+    const timeMs_t startMs = millis();
     bool success = false;
     // write it
     for (int attempt = 0; attempt < 3 && !success; attempt++) {
@@ -526,6 +550,9 @@ void writeConfigToEEPROM(void)
 #endif
         }
     }
+
+    lastEepromWriteDurationMs = millis() - startMs;
+    eepromWriteCount++;
 
     if (success) {
         return;

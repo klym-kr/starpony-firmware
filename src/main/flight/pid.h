@@ -544,6 +544,7 @@ void resetPidProfile(pidProfile_t *profile);
 
 void pidResetIterm(void);
 void pidStabilisationState(pidStabilisationState_e pidControllerState);
+bool pidIsStabilisationEnabled(void);
 void pidSetItermAccelerator(float newItermAccelerator);
 bool crashRecoveryModeActive(void);
 void pidAcroTrainerInit(void);
@@ -575,6 +576,9 @@ void pidSetItermReset(bool enabled);
 float pidGetPreviousSetpoint(int axis);
 float pidGetDT(void);
 float pidGetPidFrequency(void);
+#ifdef USE_WING
+float pidGetWingAirspeedCms(void);
+#endif
 
 float dynLpfCutoffFreq(float throttle, uint16_t dynLpfMin, uint16_t dynLpfMax, uint8_t expo);
 #ifdef USE_CHIRP

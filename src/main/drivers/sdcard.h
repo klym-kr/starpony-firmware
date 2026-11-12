@@ -65,9 +65,27 @@ bool sdcard_readBlock(uint32_t blockIndex, uint8_t *buffer, sdcard_operationComp
 sdcardOperationStatus_e sdcard_beginWriteBlocks(uint32_t blockIndex, uint32_t blockCount);
 sdcardOperationStatus_e sdcard_writeBlock(uint32_t blockIndex, uint8_t *buffer, sdcard_operationCompleteCallback_c callback, uint32_t callbackData);
 
+typedef struct sdcardDiagStats_s {
+    uint32_t writeAttempts;
+    uint32_t writeAccepted;
+    uint32_t writeCompleted;
+    uint32_t writeRejected;
+    uint32_t writeTimeouts;
+    uint32_t writeCmdErrors;
+    uint32_t readErrors;
+    uint32_t lastWriteBlock;
+    uint32_t lastErrorBlock;
+    uint8_t lastErrorStage;
+    uint8_t lastErrorToken;
+    bool spiDmaEnabled;
+} sdcardDiagStats_t;
+
 bool sdcard_isInserted(void);
 bool sdcard_isInitialized(void);
 bool sdcard_isFunctional(void);
+bool sdcard_isBusy(void);
+uint32_t sdcard_getWriteErrorCount(void);
+void sdcard_getDiagStats(sdcardDiagStats_t *stats);
 
 bool sdcard_poll(void);
 const sdcardMetadata_t* sdcard_getMetadata(void);

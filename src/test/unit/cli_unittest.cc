@@ -334,6 +334,13 @@ uint32_t clockMicrosToCycles(uint32_t micros) { return micros; }
 uint32_t stackTotalSize(void) { return 0x4000; }
 uint32_t stackHighMem(void) { return 0x80000000; }
 uint16_t getEEPROMConfigSize(void) { return 1024; }
+bool isEEPROMVersionValid(void) { return true; }
+bool isEEPROMStructureValid(void) { return true; }
+bool isPgDirty(const pgRegistry_t *) { return false; }
+uint16_t getDirtyPgCount(void) { return 0; }
+uint32_t getLastEepromWriteDurationMs(void) { return 0; }
+uint32_t getEepromWriteCount(void) { return 0; }
+bool getRebootRequired(void) { return false; }
 
 uint8_t __config_start = 0x00;
 uint8_t __config_end = 0x10;

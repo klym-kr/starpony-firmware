@@ -337,6 +337,9 @@ static void validateAndFixConfig(void)
 
     if (featureIsConfigured(FEATURE_RX_SERIAL)) {
         featureDisableImmediate(FEATURE_RX_PARALLEL_PWM | FEATURE_RX_MSP | FEATURE_RX_PPM | FEATURE_RX_SPI | FEATURE_RX_UDP);
+#if defined(USE_SERIALRX_CRSF) && !defined(USE_SERIALRX_SBUS) && !defined(USE_SERIALRX_SPEKTRUM) && !defined(USE_SERIALRX_IBUS) && !defined(USE_SERIALRX_GHST) && !defined(USE_SERIALRX_FPORT) && !defined(USE_SERIALRX_XBUS) && !defined(USE_SERIALRX_SRXL2) && !defined(USE_SERIALRX_JETIEXBUS) && !defined(USE_SERIALRX_SUMD) && !defined(USE_SERIALRX_SUMH) && !defined(USE_SERIALRX_MAVLINK)
+        rxConfigMutable()->serialrx_provider = SERIALRX_CRSF;
+#endif
     }
 
 #ifdef USE_RX_SPI
@@ -434,9 +437,9 @@ static void validateAndFixConfig(void)
     featureDisableImmediate(~featuresSupportedByBuild);
 
     if (systemConfig()->configurationState == CONFIGURATION_STATE_UNCONFIGURED) {
-        // enable some compiled-in features by default
+        // enable essential compiled-in features by default
         uint32_t autoFeatures =
-            FEATURE_TELEMETRY | FEATURE_OSD | FEATURE_LED_STRIP;
+            FEATURE_TELEMETRY | FEATURE_OSD;
 #if defined(USE_SOFTSERIAL)
         // enable softserial if at least one pin is configured
         for (unsigned i = RESOURCE_SOFTSERIAL_OFFSET; i < RESOURCE_SOFTSERIAL_OFFSET + RESOURCE_SOFTSERIAL_COUNT; i++) {

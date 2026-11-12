@@ -31,12 +31,15 @@
 #include "common/axis.h"
 #include "common/filter.h"
 
+#include "config/config.h"
+
 #include "drivers/dshot_command.h"
 
 #include "fc/rc_controls.h"
 #include "fc/runtime_config.h"
 #include "fc/rc.h"
 
+#include "flight/ladrc.h"
 #include "flight/pid.h"
 
 #include "pg/motor.h"
@@ -362,6 +365,9 @@ void pidInit(const pidProfile_t *pidProfile)
     pidSetTargetLooptime(gyro.targetLooptime); // Initialize pid looptime
     pidInitFilters(pidProfile);
     pidInitConfig(pidProfile);
+#ifdef USE_LADRC
+    ladrcInit(systemConfig()->pidProfileIndex, pidRuntime.dT);
+#endif
 #ifdef USE_ADVANCED_TPA
     tpaCurveInit(pidProfile);
 #endif

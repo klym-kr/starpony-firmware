@@ -322,29 +322,36 @@ void spiSequenceStart(const extDevice_t *dev)
 
     dev->bus->initSegment = true;
 
-    SPI_Cmd(instance, DISABLE);
+    const bool busConfigChanged =
+        (dev->busType_u.spi.speed != bus->busType_u.spi.speed) ||
+        (dev->busType_u.spi.leadingEdge != bus->busType_u.spi.leadingEdge);
 
-    // Switch bus speed
-    if (dev->busType_u.spi.speed != bus->busType_u.spi.speed) {
-        spiSetDivisorBRreg(instance, dev->busType_u.spi.speed);
-        bus->busType_u.spi.speed = dev->busType_u.spi.speed;
-    }
+    if (busConfigChanged) {
+        SPI_Cmd(instance, DISABLE);
 
-    if (dev->busType_u.spi.leadingEdge != bus->busType_u.spi.leadingEdge) {
-        // Switch SPI clock polarity/phase
-        instance->CR1 &= ~(SPI_CPOL_High | SPI_CPHA_2Edge);
-
-        // Apply setting
-        if (dev->busType_u.spi.leadingEdge) {
-            instance->CR1 |= SPI_CPOL_Low | SPI_CPHA_1Edge;
-        } else
-        {
-            instance->CR1 |= SPI_CPOL_High | SPI_CPHA_2Edge;
+        // Switch bus speed
+        if (dev->busType_u.spi.speed != bus->busType_u.spi.speed) {
+            spiSetDivisorBRreg(instance, dev->busType_u.spi.speed);
+            bus->busType_u.spi.speed = dev->busType_u.spi.speed;
         }
-        bus->busType_u.spi.leadingEdge = dev->busType_u.spi.leadingEdge;
-    }
 
-    SPI_Cmd(instance, ENABLE);
+        if (dev->busType_u.spi.leadingEdge != bus->busType_u.spi.leadingEdge) {
+            // Switch SPI clock polarity/phase
+            instance->CR1 &= ~(SPI_CPOL_High | SPI_CPHA_2Edge);
+
+            // Apply setting
+            if (dev->busType_u.spi.leadingEdge) {
+                instance->CR1 |= SPI_CPOL_Low | SPI_CPHA_1Edge;
+            } else {
+                instance->CR1 |= SPI_CPOL_High | SPI_CPHA_2Edge;
+            }
+            bus->busType_u.spi.leadingEdge = dev->busType_u.spi.leadingEdge;
+        }
+
+        SPI_Cmd(instance, ENABLE);
+    } else if ((instance->CR1 & SPI_CR1_SPE) == 0) {
+        SPI_Cmd(instance, ENABLE);
+    }
 
     // Check that any there are no attempts to DMA to/from CCD SRAM
     for (busSegment_t *checkSegment = (busSegment_t *)bus->curSegment; checkSegment->len; checkSegment++) {

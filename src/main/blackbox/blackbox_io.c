@@ -90,8 +90,8 @@ static struct {
     } state;
 } blackboxSDCard;
 
-#define LOGFILE_PREFIX "LOG"
-#define LOGFILE_SUFFIX "BFL"
+#define LOGFILE_PREFIX "ST4R"
+#define LOGFILE_SUFFIX "SBL"
 
 #endif // USE_SDCARD
 
@@ -170,48 +170,77 @@ void blackboxWrite(uint8_t value)
 #endif
 }
 
-// Print the null-terminated string 's' to the blackbox device and return the number of bytes written
-int blackboxWriteString(const char *s)
+uint32_t blackboxDeviceWrite(const uint8_t *buffer, uint32_t length)
 {
-    int length;
-    const uint8_t *pos;
+    if (!buffer || length == 0) {
+        return 0;
+    }
+
+    uint32_t written = 0;
 
     switch (blackboxConfig()->device) {
-
 #ifdef USE_FLASHFS
-    case BLACKBOX_DEVICE_FLASH:
-        length = strlen(s);
-        flashfsWrite((const uint8_t*) s, length, false); // Write asynchronously
+    case BLACKBOX_DEVICE_FLASH: {
+        const uint32_t freeSpace = flashfsGetWriteBufferFreeSpace();
+        written = MIN(length, freeSpace);
+        if (written > 0) {
+            flashfsWrite(buffer, written, false);
+        }
         break;
-#endif // USE_FLASHFS
-
+    }
+#endif
 #ifdef USE_SDCARD
     case BLACKBOX_DEVICE_SDCARD:
-        length = strlen(s);
-        afatfs_fwrite(blackboxSDCard.logFile, (const uint8_t*) s, length); // Ignore failures due to buffers filling up
-        break;
-#endif // USE_SDCARD
-
-#ifdef USE_BLACKBOX_VIRTUAL
-    case BLACKBOX_DEVICE_VIRTUAL:
-        length = strlen(s);
-        blackboxVirtualWrite((const uint8_t*) s, length);
+        if (blackboxSDCard.logFile) {
+            written = afatfs_fwrite(blackboxSDCard.logFile, buffer, length);
+        }
         break;
 #endif
-
+#ifdef USE_BLACKBOX_VIRTUAL
+    case BLACKBOX_DEVICE_VIRTUAL:
+        blackboxVirtualWrite(buffer, length);
+        written = length;
+        break;
+#endif
     case BLACKBOX_DEVICE_SERIAL:
     default:
-        pos = (uint8_t*) s;
-        while (*pos) {
-            blackboxWrite(*pos);
-            pos++;
+        if (blackboxPort) {
+            const uint32_t freeSpace = serialTxBytesFree(blackboxPort);
+            written = MIN(length, freeSpace);
+            for (uint32_t i = 0; i < written; i++) {
+                serialWrite(blackboxPort, buffer[i]);
+            }
         }
-
-        length = pos - (uint8_t*) s;
         break;
     }
 
-    return length;
+#ifdef DEBUG_BB_OUTPUT
+    bbBits += written * 8;
+    if (written < length) {
+        bbDrops += (length - written);
+        DEBUG_SET(DEBUG_BLACKBOX_OUTPUT, 2, bbDrops);
+    }
+    timeMs_t now = millis();
+    if (now > bbLastclearMs + 100) {
+        uint16_t bbRate = ((bbBits * 10 + 5) / (now - bbLastclearMs)) / 10;
+        DEBUG_SET(DEBUG_BLACKBOX_OUTPUT, 0, bbRate);
+        if (bbRate > bbRateMax) {
+            bbRateMax = bbRate;
+            DEBUG_SET(DEBUG_BLACKBOX_OUTPUT, 1, bbRateMax);
+        }
+        bbLastclearMs = now;
+        bbBits = 0;
+    }
+#endif
+
+    return written;
+}
+
+// Print the null-terminated string 's' to the blackbox device and return the number of bytes written
+int blackboxWriteString(const char *s)
+{
+    const uint32_t length = (uint32_t)strlen(s);
+    return (int)blackboxDeviceWrite((const uint8_t *)s, length);
 }
 
 /**
@@ -436,6 +465,19 @@ bool isBlackboxErased(void)
 }
 #endif
 
+void blackboxResetSDCard(void)
+{
+#ifdef USE_SDCARD
+    blackboxInit();
+    if (blackboxConfig()->device == BLACKBOX_DEVICE_SDCARD) {
+        blackboxSDCard.logFile = NULL;
+        blackboxSDCard.logDirectory = NULL;
+        blackboxSDCard.largestLogFileNumber = 0;
+        blackboxSDCard.state = BLACKBOX_SDCARD_INITIAL;
+    }
+#endif
+}
+
 /**
  * Close the Blackbox logging device.
  */
@@ -506,9 +548,9 @@ static void blackboxCreateLogFile(void)
 {
     int32_t remainder = blackboxSDCard.largestLogFileNumber + 1;
 
-    char filename[] = LOGFILE_PREFIX "00000." LOGFILE_SUFFIX;
+    char filename[] = LOGFILE_PREFIX "0000." LOGFILE_SUFFIX;
 
-    for (int i = 7; i >= 3; i--) {
+    for (int i = 7; i >= 4; i--) {
         filename[i] = (remainder % 10) + '0';
         remainder /= 10;
     }
@@ -544,13 +586,13 @@ static bool blackboxSDCardBeginLog(void)
     case BLACKBOX_SDCARD_ENUMERATE_FILES:
         while (afatfs_findNext(blackboxSDCard.logDirectory, &blackboxSDCard.logDirectoryFinder, &directoryEntry) == AFATFS_OPERATION_SUCCESS) {
             if (directoryEntry && !fat_isDirectoryEntryTerminator(directoryEntry)) {
-                // If this is a log file, parse the log number from the filename
-                if (strncmp(directoryEntry->filename, LOGFILE_PREFIX, strlen(LOGFILE_PREFIX)) == 0
-                    && strncmp(directoryEntry->filename + 8, LOGFILE_SUFFIX, strlen(LOGFILE_SUFFIX)) == 0) {
-                    char logSequenceNumberString[6];
+                // If this is a log file, parse the 4-digit sequence number from the 8.3 filename (ST4R0001SBL)
+                if (strncmp(directoryEntry->filename, LOGFILE_PREFIX, 4) == 0
+                    && strncmp(directoryEntry->filename + 8, LOGFILE_SUFFIX, 3) == 0) {
+                    char logSequenceNumberString[5];
 
-                    memcpy(logSequenceNumberString, directoryEntry->filename + 3, 5);
-                    logSequenceNumberString[5] = '\0';
+                    memcpy(logSequenceNumberString, directoryEntry->filename + 4, 4);
+                    logSequenceNumberString[4] = '\0';
 
                     blackboxSDCard.largestLogFileNumber = MAX((int32_t)atoi(logSequenceNumberString), blackboxSDCard.largestLogFileNumber);
                 }

@@ -85,7 +85,9 @@
 
 #include "flight/failsafe.h"
 #include "flight/imu.h"
+#include "flight/ladrc.h"
 #include "flight/mixer.h"
+#include "flight/mixer_init.h"
 #include "flight/pid.h"
 #include "flight/pid_init.h"
 #include "flight/position.h"
@@ -94,6 +96,7 @@
 
 #include "io/asyncfatfs/asyncfatfs.h"
 #include "io/beeper.h"
+#include "io/companion_link.h"
 #include "io/displayport_msp.h"
 #include "io/flashfs.h"
 #include "io/gimbal.h"
@@ -112,6 +115,7 @@
 #include "msp/msp_protocol.h"
 #include "msp/msp_protocol_v2_betaflight.h"
 #include "msp/msp_protocol_v2_common.h"
+#include "msp/msp_protocol_v2_st4rpony.h"
 #include "msp/msp_serial.h"
 
 #include "osd/osd.h"
@@ -462,6 +466,13 @@ RAM_CODE static void writeReadEeprom(dispatchEntry_t* self)
 dispatchEntry_t writeReadEepromEntry = {
     writeReadEeprom, 0, NULL, false
 };
+
+static inline void sbufWriteF32(sbuf_t *dst, float value)
+{
+    uint32_t raw;
+    memcpy(&raw, &value, sizeof(raw));
+    sbufWriteU32(dst, raw);
+}
 
 RAM_CODE static void serializeSDCardSummaryReply(sbuf_t *dst)
 {
@@ -1278,6 +1289,12 @@ case MSP_NAME:
 #ifdef USE_MOTOR
             if (!motorIsEnabled() || i >= MAX_SUPPORTED_MOTORS || !motorIsMotorEnabled(i)) {
                 sbufWriteU16(dst, 0);
+                continue;
+            }
+            if (isMotorProtocolDshot()
+                && ((bool)featureIsEnabled(FEATURE_3D) != mixerRuntime.feature3dEnabled)
+                && motor[i] == mixerRuntime.disarmMotorOutput) {
+                sbufWriteU16(dst, mixerRuntime.feature3dEnabled ? PWM_RANGE_MIDDLE : PWM_RANGE_MIN);
                 continue;
             }
 
@@ -2843,6 +2860,141 @@ RAM_CODE static mspResult_e mspFcProcessOutCommandWithArg(mspDescriptor_t srcDes
         break;
 #endif
 
+#ifdef USE_LADRC
+    case MSP2_ST4R_GET_LADRC_CONFIG: {
+        const uint8_t profileIndex = sbufBytesRemaining(src) ? sbufReadU8(src) : getCurrentPidProfileIndex();
+        if (profileIndex >= PID_PROFILE_COUNT) {
+            return MSP_RESULT_ERROR;
+        }
+        const ladrcProfile_t *profile = ladrcProfiles(profileIndex);
+        sbufWriteU8(dst, profileIndex);
+        sbufWriteU8(dst, profile->anti_windup);
+        sbufWriteU8(dst, profile->vbat_b0_comp);
+        sbufWriteU8(dst, profile->airspeed_sched);
+        sbufWriteU16(dst, profile->airspeed_ref_cms);
+        sbufWriteU16(dst, profile->disturbance_limit);
+        for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
+            sbufWriteU8(dst, profile->axis[axis].order);
+            sbufWriteU16(dst, profile->axis[axis].wc_deci);
+            sbufWriteU16(dst, profile->axis[axis].wo_deci);
+            sbufWriteU16(dst, profile->axis[axis].b0_deci);
+            sbufWriteU16(dst, profile->axis[axis].td_hz);
+        }
+        break;
+    }
+
+    case MSP2_ST4R_GET_LADRC_STATE: {
+        const uint8_t profileIndex = getCurrentPidProfileIndex();
+        sbufWriteU8(dst, 1); // LADRC is sole active controller
+        sbufWriteU8(dst, profileIndex);
+        sbufWriteU16(dst, (uint16_t)targetPidLooptime);
+        sbufWriteU16(dst, (uint16_t)lrintf(ladrcGetExternalB0Scale() * 1000.0f));
+        sbufWriteU16(dst, (uint16_t)lrintf(mixerGetAuthorityScale() * 1000.0f));
+        for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
+            const ladrcRuntimeAxis_t *st = ladrcGetAxisState(axis);
+            sbufWriteF32(dst, st ? (st->z1 * LADRC_RATE_SCALE_FROM_NORM) : 0.0f);
+            sbufWriteF32(dst, st ? st->z2 : 0.0f);
+            sbufWriteF32(dst, st ? st->distTermSum : 0.0f);
+            sbufWriteF32(dst, st ? (st->pTermSum + st->dTermSum) : 0.0f);
+            sbufWriteF32(dst, st ? (st->uCmdNorm * PID_MIXER_SCALING) : 0.0f);
+        }
+        break;
+    }
+
+    case MSP2_ST4R_GET_PARAM_DEBUG: {
+        sbufWriteU8(dst, (isEEPROMVersionValid() && isEEPROMStructureValid()) ? 1 : 0);
+        sbufWriteU8(dst, getCurrentPidProfileIndex());
+        sbufWriteU8(dst, getRebootRequired() ? 1 : 0);
+        sbufWriteU8(dst, isConfigDirty() ? 1 : 0);
+        sbufWriteU16(dst, getDirtyPgCount());
+        sbufWriteU16(dst, gyro.sampleRateHz);
+        sbufWriteU32(dst, getEEPROMConfigSize());
+        sbufWriteU32(dst, (uint32_t)getEEPROMStorageSize());
+        sbufWriteU32(dst, getLastEepromWriteDurationMs());
+        sbufWriteU32(dst, getEepromWriteCount());
+        sbufWriteU32(dst, featureConfig()->enabledFeatures);
+        sbufWriteU32(dst, (featureRuntimeMask() & ~FEATURE_3D) | (mixerRuntime.feature3dEnabled ? FEATURE_3D : 0));
+        sbufWriteU32(dst, targetPidLooptime);
+        sbufWriteU16(dst, gyroConfig()->gyro_lpf1_static_hz);
+#ifdef USE_DYN_LPF
+        sbufWriteU16(dst, gyroConfig()->gyro_lpf1_dyn_min_hz);
+        sbufWriteU16(dst, gyroConfig()->gyro_lpf1_dyn_max_hz);
+#else
+        sbufWriteU16(dst, 0);
+        sbufWriteU16(dst, 0);
+#endif
+        sbufWriteU16(dst, gyroConfig()->gyro_lpf2_static_hz);
+#ifdef USE_DYN_NOTCH_FILTER
+        sbufWriteU8(dst, dynNotchConfig()->dyn_notch_count);
+#else
+        sbufWriteU8(dst, 0);
+#endif
+#ifdef USE_BLACKBOX
+        sbufWriteU8(dst, blackboxConfig()->device);
+        sbufWriteU8(dst, blackboxConfig()->sample_rate);
+#else
+        sbufWriteU8(dst, 0);
+        sbufWriteU8(dst, 0);
+#endif
+        sbufWriteU8(dst, systemConfig()->debug_mode);
+
+        for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
+            const ladrcRuntimeAxis_t *st = ladrcGetAxisState(axis);
+            sbufWriteU8(dst, st ? st->order : 0);
+            sbufWriteU8(dst, 0);
+            sbufWriteU8(dst, 0);
+            sbufWriteU8(dst, 0);
+            sbufWriteF32(dst, st ? (st->dt * 1e6f) : 0.0f);
+            sbufWriteF32(dst, st ? st->wc : 0.0f);
+            sbufWriteF32(dst, st ? st->wo : 0.0f);
+            sbufWriteF32(dst, st ? st->b0Nom : 0.0f);
+            sbufWriteF32(dst, st ? st->b0Eff : 0.0f);
+            sbufWriteF32(dst, st ? st->lc1 : 0.0f);
+            sbufWriteF32(dst, st ? st->lc2 : 0.0f);
+            sbufWriteF32(dst, st ? st->lc3 : 0.0f);
+            sbufWriteF32(dst, st ? st->distLimitNorm : 0.0f);
+        }
+        break;
+    }
+#endif
+
+#ifdef USE_COMPANION_LINK
+    case MSP2_ST4R_GET_COMPANION_STATUS: {
+        const companionConfig_t *cfg = companionConfig();
+        const companionStatus_t *st = companionLinkGetStatus();
+        const uint64_t offBits = (uint64_t)st->lastClockOffsetUs;
+        sbufWriteU8(dst, cfg->enabled);
+        sbufWriteU8(dst, st->linkAlive ? 1 : 0);
+        sbufWriteU8(dst, st->offboardActive ? 1 : 0);
+        sbufWriteU8(dst, st->activeMode);
+        sbufWriteU8(dst, cfg->failsafe_policy);
+        sbufWriteU8(dst, cfg->allow_offboard_rate);
+        sbufWriteU8(dst, cfg->allow_offboard_att);
+        sbufWriteU16(dst, cfg->default_ttl_ms);
+        sbufWriteU16(dst, cfg->telemetry_hz);
+        sbufWriteU16(dst, st->lastSeq);
+        sbufWriteU32(dst, st->rxPacketCount);
+        sbufWriteU32(dst, st->timeoutCount);
+        sbufWriteU32(dst, (uint32_t)(offBits & 0xFFFFFFFFULL));
+        sbufWriteU32(dst, (uint32_t)(offBits >> 32));
+        break;
+    }
+
+    case MSP2_ST4R_TIME_SYNC: {
+        if (sbufBytesRemaining(src) < 8) {
+            return MSP_RESULT_ERROR;
+        }
+        const uint32_t clientLo = sbufReadU32(src);
+        const uint32_t clientHi = sbufReadU32(src);
+        const uint32_t fcRxUs = micros();
+        sbufWriteU32(dst, clientLo);
+        sbufWriteU32(dst, clientHi);
+        sbufWriteU32(dst, fcRxUs);
+        sbufWriteU32(dst, 0);
+        break;
+    }
+#endif
+
     default:
         return MSP_RESULT_CMD_UNKNOWN;
     }
@@ -3086,7 +3238,9 @@ RAM_CODE static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t
         }
         break;
 
-    case MSP_SET_MOTOR_CONFIG:
+    case MSP_SET_MOTOR_CONFIG: {
+        const uint16_t prevMaxThrottle = motorConfig()->maxthrottle;
+        const uint16_t prevMinCommand = motorConfig()->mincommand;
         sbufReadU16(src);   // minthrottle deprecated in 4.6
         motorConfigMutable()->maxthrottle = sbufReadU16(src);
         motorConfigMutable()->mincommand = sbufReadU16(src);
@@ -3095,12 +3249,19 @@ RAM_CODE static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t
         if (sbufBytesRemaining(src) >= 2) {
             motorConfigMutable()->motorPoleCount = sbufReadU8(src);
 #if defined(USE_DSHOT_TELEMETRY)
-            motorConfigMutable()->dev.useDshotTelemetry = sbufReadU8(src);
+            configRebootUpdateCheckU8(&motorConfigMutable()->dev.useDshotTelemetry, sbufReadU8(src));
 #else
             sbufReadU8(src);
 #endif
         }
+        if (!ARMING_FLAG(ARMED) && (motorConfig()->maxthrottle != prevMaxThrottle || motorConfig()->mincommand != prevMinCommand)) {
+            if ((bool)featureIsEnabled(FEATURE_3D) == mixerRuntime.feature3dEnabled) {
+                initEscEndpoints();
+            }
+            mixerResetDisarmedMotors();
+        }
         break;
+    }
 
 #ifdef USE_GPS
     case MSP_SET_GPS_CONFIG:
@@ -3167,12 +3328,26 @@ RAM_CODE static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t
 #endif
 
     case MSP_SET_MOTOR:
-        if (dataSize < getMotorCount() * sizeof(uint16_t)) {
+        if (ARMING_FLAG(ARMED) || dataSize < getMotorCount() * sizeof(uint16_t)) {
             return MSP_RESULT_ERROR;
         }
-        for (int i = 0; i < getMotorCount(); i++) {
-            motor_disarmed[i] = motorConvertFromExternal(sbufReadU16(src));
+        {
+            const uint16_t runtimeStopUs = mixerRuntime.feature3dEnabled ? PWM_RANGE_MIDDLE : PWM_RANGE_MIN;
+            const bool feature3dPendingReboot = ((bool)featureIsEnabled(FEATURE_3D) != mixerRuntime.feature3dEnabled)
+                || ((bool)featureIsConfigured(FEATURE_3D) != mixerRuntime.feature3dEnabled);
+            for (int i = 0; i < getMotorCount(); i++) {
+                const uint16_t cmdUs = constrain(sbufReadU16(src), PWM_RANGE_MIN, PWM_RANGE_MAX);
+                if (cmdUs == runtimeStopUs) {
+                    motor_disarmed[i] = mixerRuntime.disarmMotorOutput;
+                } else if (feature3dPendingReboot) {
+                    mixerResetDisarmedMotors();
+                    return MSP_RESULT_ERROR;
+                } else {
+                    motor_disarmed[i] = motorConvertFromExternal(cmdUs);
+                }
+            }
         }
+        mixerNoteMspMotorCommand(micros());
         break;
 
     case MSP_SET_SERVO_CONFIGURATION:
@@ -3184,12 +3359,24 @@ RAM_CODE static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t
         if (i >= MAX_SUPPORTED_SERVOS) {
             return MSP_RESULT_ERROR;
         } else {
-            servoParamsMutable(i)->min = sbufReadU16(src);
-            servoParamsMutable(i)->max = sbufReadU16(src);
-            servoParamsMutable(i)->middle = sbufReadU16(src);
-            servoParamsMutable(i)->rate = sbufReadU8(src);
-            servoParamsMutable(i)->forwardFromChannel = sbufReadU8(src);
-            servoParamsMutable(i)->reversedSources = sbufReadU32(src);
+            const uint16_t min = sbufReadU16(src);
+            const uint16_t max = sbufReadU16(src);
+            const uint16_t middle = sbufReadU16(src);
+            const int8_t rate = (int8_t)sbufReadU8(src);
+            const uint8_t forwardFromChannel = sbufReadU8(src);
+            const uint32_t reversedSources = sbufReadU32(src);
+            if (min < PWM_SERVO_MIN || max > PWM_SERVO_MAX || min > max
+                || middle < PWM_SERVO_MIN || middle > PWM_SERVO_MAX
+                || rate < -125 || rate > 125
+                || (forwardFromChannel != CHANNEL_FORWARDING_DISABLED && forwardFromChannel >= MAX_SUPPORTED_RC_CHANNEL_COUNT)) {
+                return MSP_RESULT_ERROR;
+            }
+            servoParamsMutable(i)->min = min;
+            servoParamsMutable(i)->max = max;
+            servoParamsMutable(i)->middle = middle;
+            servoParamsMutable(i)->rate = rate;
+            servoParamsMutable(i)->forwardFromChannel = forwardFromChannel;
+            servoParamsMutable(i)->reversedSources = reversedSources;
         }
 #endif
         break;
@@ -3264,7 +3451,13 @@ RAM_CODE static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t
         break;
     }
 
-    case MSP_SET_ADVANCED_CONFIG:
+    case MSP_SET_ADVANCED_CONFIG: {
+        const uint8_t prevPidDenom = pidConfig()->pid_process_denom;
+        const uint8_t prevContinuousUpdate = motorConfig()->dev.useContinuousUpdate;
+        const uint8_t prevMotorProtocol = motorConfig()->dev.motorProtocol;
+        const uint16_t prevMotorPwmRate = motorConfig()->dev.motorPwmRate;
+        const uint8_t prevMotorInversion = motorConfig()->dev.motorInversion;
+
         sbufReadU8(src); // was gyroConfigMutable()->gyro_sync_denom - removed in API 1.43
         pidConfigMutable()->pid_process_denom = sbufReadU8(src);
         motorConfigMutable()->dev.useContinuousUpdate = sbufReadU8(src);
@@ -3290,11 +3483,29 @@ RAM_CODE static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t
         if (sbufBytesRemaining(src) >= 1) {
             //Added in MSP API 1.42
             systemConfigMutable()->debug_mode = sbufReadU8(src);
+            debugMode = systemConfig()->debug_mode;
         }
 
         validateAndFixGyroConfig();
 
+        if (!ARMING_FLAG(ARMED) && pidConfig()->pid_process_denom != prevPidDenom) {
+            gyroSetTargetLooptime(pidConfig()->pid_process_denom);
+            gyroInitFilters();
+            pidInit(currentPidProfile);
+            mixerInitProfile();
+#ifdef USE_SERVOS
+            servosFilterInit();
+#endif
+            setRebootRequired();
+        } else if (motorConfig()->dev.useContinuousUpdate != prevContinuousUpdate
+            || motorConfig()->dev.motorProtocol != prevMotorProtocol
+            || motorConfig()->dev.motorPwmRate != prevMotorPwmRate
+            || motorConfig()->dev.motorInversion != prevMotorInversion) {
+            setRebootRequired();
+        }
+
         break;
+    }
     case MSP_SET_FILTER_CONFIG:
         gyroConfigMutable()->gyro_lpf1_static_hz = sbufReadU8(src);
         currentPidProfile->dterm_lpf1_static_hz = sbufReadU16(src);
@@ -3419,8 +3630,9 @@ RAM_CODE static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t
         // reinitialize the gyro filters with the new values
         validateAndFixGyroConfig();
         gyroInitFilters();
-        // reinitialize the PID filters with the new values
+        // reinitialize the PID filters & dynamic filter bounds with the new values
         pidInitFilters(currentPidProfile);
+        pidInitConfig(currentPidProfile);
 
         break;
     case MSP_SET_PID_ADVANCED:
@@ -3915,6 +4127,9 @@ RAM_CODE static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t
             readSimplifiedDtermFilters(currentPidProfile, src);
             readSimplifiedGyroFilters(gyroConfigMutable(), src);
             applySimplifiedTuning(currentPidProfile, gyroConfigMutable());
+            validateAndFixGyroConfig();
+            gyroInitFilters();
+            pidInit(currentPidProfile);
         }
         break;
 #endif
@@ -4045,7 +4260,13 @@ RAM_CODE static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t
 
     case MSP_SET_MIXER_CONFIG:
 #ifndef USE_QUAD_MIXER_ONLY
-        mixerConfigMutable()->mixerMode = sbufReadU8(src);
+        {
+            const uint8_t reqMixerMode = sbufReadU8(src);
+            if (reqMixerMode < MIXER_TRI || reqMixerMode > MIXER_OCTOX8P) {
+                return MSP_RESULT_ERROR;
+            }
+            configRebootUpdateCheckU8(&mixerConfigMutable()->mixerMode, reqMixerMode);
+        }
 #else
         sbufReadU8(src);
 #endif
@@ -4055,7 +4276,15 @@ RAM_CODE static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t
         break;
 
     case MSP_SET_RX_CONFIG:
-        rxConfigMutable()->serialrx_provider = sbufReadU8(src);
+        {
+            const uint8_t reqProvider = sbufReadU8(src);
+#if defined(USE_SERIALRX_CRSF) && !defined(USE_SERIALRX_SBUS) && !defined(USE_SERIALRX_SPEKTRUM) && !defined(USE_SERIALRX_IBUS) && !defined(USE_SERIALRX_GHST) && !defined(USE_SERIALRX_FPORT) && !defined(USE_SERIALRX_XBUS) && !defined(USE_SERIALRX_SRXL2) && !defined(USE_SERIALRX_JETIEXBUS) && !defined(USE_SERIALRX_SUMD) && !defined(USE_SERIALRX_SUMH) && !defined(USE_SERIALRX_MAVLINK)
+            UNUSED(reqProvider);
+            rxConfigMutable()->serialrx_provider = SERIALRX_CRSF;
+#else
+            rxConfigMutable()->serialrx_provider = reqProvider;
+#endif
+        }
         rxConfigMutable()->maxcheck = sbufReadU16(src);
         rxConfigMutable()->midrc = sbufReadU16(src);
         rxConfigMutable()->mincheck = sbufReadU16(src);
@@ -4482,6 +4711,96 @@ RAM_CODE static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t
         profile->consumptionWarningPercentage = consumptionWarnPct;
         break;
     }
+
+#ifdef USE_LADRC
+    case MSP2_ST4R_SET_LADRC_CONFIG: {
+        const unsigned expectedSize = 8 + (XYZ_AXIS_COUNT * 9);
+        if (sbufBytesRemaining(src) < (int)expectedSize) {
+            return MSP_RESULT_ERROR;
+        }
+        const uint8_t profileIndex = sbufReadU8(src);
+        if (profileIndex >= PID_PROFILE_COUNT) {
+            return MSP_RESULT_ERROR;
+        }
+        const uint8_t antiWindup = sbufReadU8(src) ? 1 : 0;
+        const uint8_t vbatB0Comp = sbufReadU8(src) ? 1 : 0;
+        const uint8_t airspeedSched = sbufReadU8(src) ? 1 : 0;
+        const uint16_t airspeedRefCms = sbufReadU16(src);
+        const uint16_t distLimit = sbufReadU16(src);
+        if (airspeedRefCms < 300 || airspeedRefCms > 10000 || distLimit > 1000) {
+            return MSP_RESULT_ERROR;
+        }
+
+        ladrcAxisProfile_t parsedAxes[XYZ_AXIS_COUNT];
+        for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
+            parsedAxes[axis].order = sbufReadU8(src);
+            parsedAxes[axis].wc_deci = sbufReadU16(src);
+            parsedAxes[axis].wo_deci = sbufReadU16(src);
+            parsedAxes[axis].b0_deci = sbufReadU16(src);
+            parsedAxes[axis].td_hz = sbufReadU16(src);
+            if ((parsedAxes[axis].order != LADRC_ORDER_1 && parsedAxes[axis].order != LADRC_ORDER_2)
+                || parsedAxes[axis].wc_deci < 5 || parsedAxes[axis].wc_deci > 2000
+                || parsedAxes[axis].wo_deci < 10 || parsedAxes[axis].wo_deci > 10000
+                || parsedAxes[axis].b0_deci < 1 || parsedAxes[axis].b0_deci > 60000
+                || parsedAxes[axis].td_hz > 500) {
+                return MSP_RESULT_ERROR;
+            }
+        }
+
+        ladrcProfile_t *profile = ladrcProfilesMutable(profileIndex);
+        profile->anti_windup = antiWindup;
+        profile->vbat_b0_comp = vbatB0Comp;
+        profile->airspeed_sched = airspeedSched;
+        profile->airspeed_ref_cms = airspeedRefCms;
+        profile->disturbance_limit = distLimit;
+        for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
+            profile->axis[axis] = parsedAxes[axis];
+        }
+
+        if (profileIndex == getCurrentPidProfileIndex()) {
+            ladrcInit(profileIndex, pidGetDT());
+        }
+        break;
+    }
+#endif
+
+#ifdef USE_COMPANION_LINK
+    case MSP2_ST4R_SET_COMPANION_CMD: {
+        if (sbufBytesRemaining(src) < 21) {
+            return MSP_RESULT_ERROR;
+        }
+        const uint16_t seq = sbufReadU16(src);
+        const uint16_t ttlMs = sbufReadU16(src);
+        const uint8_t mode = sbufReadU8(src);
+        float target[4];
+        for (int i = 0; i < 4; i++) {
+            uint32_t raw = sbufReadU32(src);
+            memcpy(&target[i], &raw, 4);
+        }
+        if (!companionLinkAcceptOffboardCmd(seq, ttlMs, mode, target, micros())) {
+            return MSP_RESULT_ERROR;
+        }
+        break;
+    }
+#endif
+
+#ifdef USE_SDCARD
+    case MSP2_ST4R_SDCARD_FORMAT:
+        if (ARMING_FLAG(ARMED)
+            || sdcardConfig()->mode == SDCARD_MODE_NONE
+            || !sdcard_isInserted()
+            || !sdcard_isFunctional()
+            || !sdcard_isInitialized()) {
+            return MSP_RESULT_ERROR;
+        }
+#ifdef USE_BLACKBOX
+        blackboxResetSDCard();
+#endif
+        if (!afatfs_format()) {
+            return MSP_RESULT_ERROR;
+        }
+        break;
+#endif
 
     default:
         // we do not know how to handle the (valid) message, indicate error MSP $M!

@@ -36,6 +36,7 @@ bool cliMode = false;
 #ifdef USE_CLI
 
 #include "blackbox/blackbox.h"
+#include "blackbox/blackbox_io.h"
 
 #include "build/build_config.h"
 #include "build/debug.h"
@@ -107,6 +108,9 @@ bool cliMode = false;
 #include "flight/failsafe.h"
 #include "flight/flight_plan_nav.h"
 #include "flight/imu.h"
+#ifdef USE_LADRC
+#include "flight/ladrc.h"
+#endif
 #include "flight/mixer.h"
 #include "flight/pid.h"
 #include "flight/position.h"
@@ -860,8 +864,11 @@ static uint16_t getValueOffset(const clivalue_t *value)
     case MASTER_VALUE:
     case HARDWARE_VALUE:
         return value->offset;
-    case PROFILE_VALUE:
-        return value->offset + sizeof(pidProfile_t) * getPidProfileIndexToUse();
+    case PROFILE_VALUE: {
+        const pgRegistry_t *rec = pgFind(value->pgn);
+        const uint16_t stride = rec ? pgElementSize(rec) : sizeof(pidProfile_t);
+        return value->offset + stride * getPidProfileIndexToUse();
+    }
     case PROFILE_RATE_VALUE:
         return value->offset + sizeof(controlRateConfig_t) * getRateProfileIndexToUse();
     case PROFILE_BATTERY_VALUE:
@@ -3169,7 +3176,61 @@ RAM_CODE static void cliSdInfo(const char *cmdName, char *cmdline)
         }
         break;
     }
+    cliPrintf(", err=%lu", (unsigned long)sdcard_getWriteErrorCount());
     cliPrintLinefeed();
+    if (strcmp(cmdName, "sd_info") == 0) {
+        sdcardDiagStats_t d;
+        sdcard_getDiagStats(&d);
+        cliPrintf("SD-DIAG: dma=%u att=%lu acc=%lu ok=%lu rej=%lu tmo=%lu cmd=%lu rd=%lu stage=%u tok=0x%02x blk=%lu\r\n",
+            d.spiDmaEnabled ? 1U : 0U,
+            (unsigned long)d.writeAttempts,
+            (unsigned long)d.writeAccepted,
+            (unsigned long)d.writeCompleted,
+            (unsigned long)d.writeRejected,
+            (unsigned long)d.writeTimeouts,
+            (unsigned long)d.writeCmdErrors,
+            (unsigned long)d.readErrors,
+            (unsigned)d.lastErrorStage,
+            (unsigned)d.lastErrorToken,
+            (unsigned long)d.lastErrorBlock
+        );
+    }
+}
+
+static void cliSdFormat(const char *cmdName, char *cmdline)
+{
+    UNUSED(cmdName);
+    if (ARMING_FLAG(ARMED)) {
+        cliPrintLine("ERR: disarmed only");
+        return;
+    }
+    if (sdcardConfig()->mode == SDCARD_MODE_NONE || !sdcard_isInserted() || !sdcard_isFunctional() || !sdcard_isInitialized()) {
+        cliPrintLine("ERR: SD card not ready");
+        return;
+    }
+    if (!cmdline || strcmp(cmdline, "YES") != 0) {
+        cliPrintLine("ERR: pass YES to confirm full FAT32 format (sd_format YES)");
+        return;
+    }
+#ifdef USE_BLACKBOX
+    blackboxResetSDCard();
+#endif
+    if (!afatfs_format()) {
+        cliPrintLine("ERR: failed to start FAT32 format");
+        return;
+    }
+    cliPrintLine("Formatting SD card (FAT32)...");
+    cliWriterFlush();
+    const uint32_t startMs = millis();
+    while (afatfs_getFilesystemState() == AFATFS_FILESYSTEM_STATE_INITIALIZATION && (millis() - startMs) < 90000U) {
+        afatfs_poll();
+        delay(1);
+    }
+    if (afatfs_getFilesystemState() == AFATFS_FILESYSTEM_STATE_READY) {
+        cliPrintLine("SD format complete.");
+    } else {
+        cliPrintLine("ERR: SD format failed or timed out");
+    }
 }
 
 #endif
@@ -5986,6 +6047,68 @@ static int getTaskAverageRateHz(taskId_e taskId, int *averageDeltaTimeUs)
     return taskInfo.averageDeltaTime10thUs == 0 ? 0 : lrintf(1e7f / taskInfo.averageDeltaTime10thUs);
 }
 
+static void cliSt4rponyDebug(const char *cmdName, char *cmdline)
+{
+    UNUSED(cmdName);
+    UNUSED(cmdline);
+
+    cliPrintLinef("EEPROM: valid=%s size=%u/%ub dirty_pgs=%u last_write=%ums writes=%u reboot_req=%u",
+        (isEEPROMVersionValid() && isEEPROMStructureValid()) ? "yes" : "NO",
+        getEEPROMConfigSize(),
+        (unsigned)getEEPROMStorageSize(),
+        getDirtyPgCount(),
+        (unsigned)getLastEepromWriteDurationMs(),
+        (unsigned)getEepromWriteCount(),
+        getRebootRequired() ? 1 : 0);
+
+    bool anyDirty = false;
+    PG_FOREACH(reg) {
+        if (isPgDirty(reg)) {
+            if (!anyDirty) {
+                cliPrint("DIRTY_PGN:");
+                anyDirty = true;
+            }
+            cliPrintf(" %u(%uB)", pgN(reg), pgSize(reg));
+        }
+    }
+    if (anyDirty) {
+        cliPrintLinefeed();
+    }
+
+    cliPrintLinef("FEATURES: configured=0x%08x runtime=0x%08x debug_mode=%u",
+        (unsigned)featureConfig()->enabledFeatures,
+        (unsigned)featureRuntimeMask(),
+        systemConfig()->debug_mode);
+
+#ifdef USE_LADRC
+    const uint8_t profileIdx = getCurrentPidProfileIndex();
+    const ladrcProfile_t *cfg = ladrcProfiles(profileIdx);
+    const char *axisNames[XYZ_AXIS_COUNT] = { "ROLL", "PITCH", "YAW" };
+    cliPrintLinef("LADRC_PROFILE[%u]: anti_windup=%u vbat_comp=%u dist_limit=%u looptime=%uus",
+        profileIdx, cfg->anti_windup, cfg->vbat_b0_comp, cfg->disturbance_limit, (unsigned)targetPidLooptime);
+    for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
+        const ladrcRuntimeAxis_t *rt = ladrcGetAxisState(axis);
+        const int32_t rtWcDeci = rt ? lrintf(rt->wc * 10.0f) : 0;
+        const int32_t rtWoDeci = rt ? lrintf(rt->wo * 10.0f) : 0;
+        const int32_t rtB0Deci = rt ? lrintf(rt->b0Nom * 10.0f) : 0;
+        const int32_t rtB0EffDeci = rt ? lrintf(rt->b0Eff * 10.0f) : 0;
+        cliPrintLinef("  %s: cfg(ord=%u wc=%u wo=%u b0=%u td=%u) rt(ord=%u wc=%d wo=%d b0=%d b0Eff=%d dt=%dus)",
+            axisNames[axis],
+            cfg->axis[axis].order,
+            cfg->axis[axis].wc_deci,
+            cfg->axis[axis].wo_deci,
+            cfg->axis[axis].b0_deci,
+            cfg->axis[axis].td_hz,
+            rt ? rt->order : 0,
+            (int)rtWcDeci,
+            (int)rtWoDeci,
+            (int)rtB0Deci,
+            (int)rtB0EffDeci,
+            rt ? (int)lrintf(rt->dt * 1e6f) : 0);
+    }
+#endif
+}
+
 RAM_CODE static void cliStatus(const char *cmdName, char *cmdline)
 {
     UNUSED(cmdName);
@@ -8381,6 +8504,7 @@ const clicmd_t cmdTable[] = {
     CLI_COMMAND_DEF("rxrange", "configure rx channel ranges", NULL, cliRxRange),
     CLI_COMMAND_DEF("save", "save and reboot (default)", "[noreboot]", cliSave),
 #ifdef USE_SDCARD
+    CLI_COMMAND_DEF("sd_format", "format SD card as FAT32 (erases all data)", "YES", cliSdFormat),
     CLI_COMMAND_DEF("sd_info", "sdcard info", NULL, cliSdInfo),
 #endif
 #if defined(USE_SENSOR_NAMES)
@@ -8410,6 +8534,7 @@ const clicmd_t cmdTable[] = {
         "\tload <mixer>\r\n"
         "\treverse <servo> <source> r|n", cliServoMix),
 #endif
+    CLI_COMMAND_DEF("st4rpony_debug", "inspect EEPROM storage, dirty PGs, and live LADRC runtime parameters", NULL, cliSt4rponyDebug),
     CLI_COMMAND_DEF("status", "show status", NULL, cliStatus),
     CLI_COMMAND_DEF("tasks", "show task stats", NULL, cliTasks),
 #ifdef USE_TIMER_MGMT

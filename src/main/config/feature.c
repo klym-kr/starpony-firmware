@@ -31,7 +31,7 @@
 PG_REGISTER_WITH_RESET_TEMPLATE(featureConfig_t, featureConfig, PG_FEATURE_CONFIG, 1);
 
 PG_RESET_TEMPLATE(featureConfig_t, featureConfig,
-    .enabledFeatures = DEFAULT_FEATURES | DEFAULT_RX_FEATURE | FEATURE_ANTI_GRAVITY | FEATURE_AIRMODE,
+    .enabledFeatures = DEFAULT_FEATURES | DEFAULT_RX_FEATURE | FEATURE_AIRMODE,
 );
 
 // bitmask of features that are supported in current build configuration
@@ -106,6 +106,11 @@ static uint32_t runtimeFeatureMask;
 void featureInit(void)
 {
     runtimeFeatureMask = featureConfig()->enabledFeatures;
+}
+
+uint32_t featureRuntimeMask(void)
+{
+    return runtimeFeatureMask;
 }
 
 static void featureSet(const uint32_t mask, uint32_t *features)

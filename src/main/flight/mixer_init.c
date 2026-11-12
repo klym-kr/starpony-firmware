@@ -41,6 +41,8 @@
 #include "flight/mixer_tricopter.h"
 #include "flight/pid.h"
 
+#include "msp/msp_serial.h"
+
 #include "rx/rx.h"
 
 #include "sensors/battery.h"
@@ -502,11 +504,57 @@ void mixerInit(mixerMode_e mixerMode)
     mixerConfigureOutput();
 }
 
+#define MSP_MOTOR_TEST_TIMEOUT_US 1000000
+
+static FAST_DATA_ZERO_INIT timeUs_t mspMotorLastCmdUs;
+static FAST_DATA_ZERO_INIT bool mspMotorOverrideActive;
+
 void mixerResetDisarmedMotors(void)
 {
+    mspMotorOverrideActive = false;
     // set disarmed motor values
     for (int i = 0; i < MAX_SUPPORTED_MOTORS; i++) {
         motor_disarmed[i] = mixerRuntime.disarmMotorOutput;
+    }
+}
+
+void mixerNoteMspMotorCommand(timeUs_t currentTimeUs)
+{
+    if (ARMING_FLAG(ARMED)) {
+        return;
+    }
+    bool anySpinning = false;
+    for (int i = 0; i < mixerRuntime.motorCount; i++) {
+        if (motor_disarmed[i] != mixerRuntime.disarmMotorOutput) {
+            anySpinning = true;
+            break;
+        }
+    }
+    if (anySpinning) {
+        mspMotorLastCmdUs = currentTimeUs;
+        mspMotorOverrideActive = true;
+    } else {
+        mixerResetDisarmedMotors();
+    }
+}
+
+void mixerServiceDisarmedTimeout(timeUs_t currentTimeUs)
+{
+    if (!mspMotorOverrideActive) {
+        // Ensure no stale disarmed motor output survives without an active MSP bench override
+        for (int i = 0; i < mixerRuntime.motorCount; i++) {
+            if (motor_disarmed[i] != mixerRuntime.disarmMotorOutput) {
+                mixerResetDisarmedMotors();
+                break;
+            }
+        }
+        return;
+    }
+
+    if (ARMING_FLAG(ARMED)
+        || !mspSerialIsConfiguratorActive()
+        || (cmpTimeUs(currentTimeUs, mspMotorLastCmdUs) > MSP_MOTOR_TEST_TIMEOUT_US)) {
+        mixerResetDisarmedMotors();
     }
 }
 

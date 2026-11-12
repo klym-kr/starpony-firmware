@@ -84,6 +84,7 @@ PG_DECLARE(featureConfig_t, featureConfig);
 extern uint32_t featuresSupportedByBuild;
 
 void featureInit(void);
+uint32_t featureRuntimeMask(void);
 bool featureIsEnabled(const uint32_t mask);
 bool featureIsConfigured(const uint32_t mask);
 void featureEnableImmediate(const uint32_t mask);

@@ -125,6 +125,7 @@ struct rxConfig_s;
 bool hasServos(void);
 uint8_t getMotorCount(void);
 float getMotorMixRange(void);
+float mixerGetAuthorityScale(void);
 bool areMotorsRunning(void);
 bool areMotorsSaturated(void);
 
@@ -134,6 +135,8 @@ void mixerInit(mixerMode_e mixerMode);
 void mixerInitProfile(void);
 void mixerResetRpmLimiter(void);
 void mixerResetDisarmedMotors(void);
+void mixerNoteMspMotorCommand(timeUs_t currentTimeUs);
+void mixerServiceDisarmedTimeout(timeUs_t currentTimeUs);
 void mixTable(timeUs_t currentTimeUs);
 void stopMotors(void);
 void writeMotors(void);

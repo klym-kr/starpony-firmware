@@ -175,6 +175,7 @@ COMMON_SRC = \
             flight/gps_rescue_multirotor.c \
             flight/gps_rescue_wing.c \
             flight/imu.c \
+            flight/ladrc.c \
             flight/mixer.c \
             flight/mixer_init.c \
             flight/mixer_tricopter.c \
@@ -190,6 +191,7 @@ COMMON_SRC = \
             flight/rpm_filter.c \
             flight/servos.c \
             flight/servos_tricopter.c \
+            io/companion_link.c \
             io/serial_4way.c \
             io/serial_4way_avrootloader.c \
             io/serial_4way_stk500v2.c \
@@ -226,7 +228,6 @@ COMMON_SRC = \
             sensors/initialisation.c \
             sensors/sensors.c \
             blackbox/blackbox.c \
-            blackbox/blackbox_encoding.c \
             blackbox/blackbox_io.c \
             cms/cms.c \
             cms/cms_menu_blackbox.c \
@@ -475,6 +476,7 @@ SPEED_OPTIMISED_SRC += \
             fc/runtime_config.c \
             flight/dyn_notch_filter.c \
             flight/imu.c \
+            flight/ladrc.c \
             flight/mixer.c \
             flight/pid.c \
             flight/rpm_filter.c \
@@ -514,6 +516,7 @@ SIZE_OPTIMISED_SRC += \
             config/config_streamer.c \
             config/simplified_tuning.c \
             io/dashboard.c \
+            io/companion_link.c \
             io/serial.c \
             io/serial_4way.c \
             io/serial_4way_avrootloader.c \

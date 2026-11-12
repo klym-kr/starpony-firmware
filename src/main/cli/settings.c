@@ -60,6 +60,7 @@
 #include "flight/failsafe.h"
 #include "flight/gps_rescue.h"
 #include "flight/imu.h"
+#include "flight/ladrc.h"
 #include "flight/mixer.h"
 #include "flight/pid.h"
 #include "flight/position.h"
@@ -67,6 +68,7 @@
 #include "flight/servos.h"
 
 #include "io/beeper.h"
+#include "io/companion_link.h"
 #include "io/dashboard.h"
 #include "io/gimbal.h"
 #include "io/gps.h"
@@ -580,6 +582,12 @@ static const char * const lookupTableTransponderProvider[] = {
 };
 #endif
 
+#ifdef USE_COMPANION_LINK
+static const char * const lookupTableCompanionFailsafe[] = {
+    "PILOT_TAKEOVER", "LEVEL_HOLD", "RTH"
+};
+#endif
+
 #define LOOKUP_TABLE_ENTRY(name) { name, ARRAYLEN(name) }
 
 const lookupTableEntry_t lookupTables[] = {
@@ -725,6 +733,9 @@ const lookupTableEntry_t lookupTables[] = {
 #endif // USE_WING
 #ifdef USE_TRANSPONDER
     LOOKUP_TABLE_ENTRY(lookupTableTransponderProvider),
+#endif
+#ifdef USE_COMPANION_LINK
+    LOOKUP_TABLE_ENTRY(lookupTableCompanionFailsafe),
 #endif
 };
 
@@ -2110,6 +2121,46 @@ const clivalue_t valueTable[] = {
     { "gimbal_yaw_limit",          VAR_INT8 | MASTER_VALUE, .config.minmaxUnsigned = { -100, 100 }, PG_GIMBAL_TRACK_CONFIG, offsetof(gimbalTrackConfig_t, gimbal_yaw_limit) },
     { "gimbal_stabilisation",      VAR_INT8 | MASTER_VALUE, .config.minmaxUnsigned = { 0, 7 }, PG_GIMBAL_TRACK_CONFIG, offsetof(gimbalTrackConfig_t, gimbal_stabilisation) },
     { "gimbal_sensitivity",        VAR_INT8 | MASTER_VALUE, .config.minmaxUnsigned = { -16, 15 }, PG_GIMBAL_TRACK_CONFIG, offsetof(gimbalTrackConfig_t, gimbal_sensitivity) },
+#endif
+
+#ifdef USE_LADRC
+// PG_LADRC_PROFILE
+    { "ladrc_anti_windup",         VAR_UINT8  | PROFILE_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_OFF_ON }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, anti_windup) },
+    { "ladrc_vbat_b0_comp",        VAR_UINT8  | PROFILE_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_OFF_ON }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, vbat_b0_comp) },
+    { "ladrc_airspeed_sched",      VAR_UINT8  | PROFILE_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_OFF_ON }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, airspeed_sched) },
+    { "ladrc_airspeed_ref_cms",    VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 300, 10000 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, airspeed_ref_cms) },
+    { "ladrc_disturbance_limit",   VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 0, 1000 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, disturbance_limit) },
+
+    { "ladrc_roll_order",          VAR_UINT8  | PROFILE_VALUE, .config.minmaxUnsigned = { 1, 2 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, axis[FD_ROLL].order) },
+    { "ladrc_roll_wc",             VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 5, 2000 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, axis[FD_ROLL].wc_deci) },
+    { "ladrc_roll_wo",             VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 10, 10000 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, axis[FD_ROLL].wo_deci) },
+    { "ladrc_roll_b0",             VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 1, 60000 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, axis[FD_ROLL].b0_deci) },
+    { "ladrc_roll_td_hz",          VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 0, 500 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, axis[FD_ROLL].td_hz) },
+
+    { "ladrc_pitch_order",         VAR_UINT8  | PROFILE_VALUE, .config.minmaxUnsigned = { 1, 2 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, axis[FD_PITCH].order) },
+    { "ladrc_pitch_wc",            VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 5, 2000 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, axis[FD_PITCH].wc_deci) },
+    { "ladrc_pitch_wo",            VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 10, 10000 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, axis[FD_PITCH].wo_deci) },
+    { "ladrc_pitch_b0",            VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 1, 60000 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, axis[FD_PITCH].b0_deci) },
+    { "ladrc_pitch_td_hz",         VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 0, 500 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, axis[FD_PITCH].td_hz) },
+
+    { "ladrc_yaw_order",           VAR_UINT8  | PROFILE_VALUE, .config.minmaxUnsigned = { 1, 2 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, axis[FD_YAW].order) },
+    { "ladrc_yaw_wc",              VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 5, 2000 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, axis[FD_YAW].wc_deci) },
+    { "ladrc_yaw_wo",              VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 10, 10000 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, axis[FD_YAW].wo_deci) },
+    { "ladrc_yaw_b0",              VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 1, 60000 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, axis[FD_YAW].b0_deci) },
+    { "ladrc_yaw_td_hz",           VAR_UINT16 | PROFILE_VALUE, .config.minmaxUnsigned = { 0, 500 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, axis[FD_YAW].td_hz) },
+
+    { "ladrc_sat_z3_inhibit",      VAR_UINT8  | PROFILE_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_OFF_ON }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, sat_z3_inhibit) },
+    { "ladrc_ground_wc_pct",       VAR_UINT8  | PROFILE_VALUE, .config.minmaxUnsigned = { 0, 100 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, ground_wc_pct) },
+#endif
+
+#ifdef USE_COMPANION_LINK
+// PG_COMPANION_CONFIG
+    { "companion_enabled",         VAR_UINT8  | MASTER_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_OFF_ON }, PG_COMPANION_CONFIG, offsetof(companionConfig_t, enabled) },
+    { "companion_ttl_ms",          VAR_UINT16 | MASTER_VALUE, .config.minmaxUnsigned = { 20, 2000 }, PG_COMPANION_CONFIG, offsetof(companionConfig_t, default_ttl_ms) },
+    { "companion_telemetry_hz",    VAR_UINT16 | MASTER_VALUE, .config.minmaxUnsigned = { 10, 500 }, PG_COMPANION_CONFIG, offsetof(companionConfig_t, telemetry_hz) },
+    { "companion_failsafe_policy", VAR_UINT8  | MASTER_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_COMPANION_FAILSAFE }, PG_COMPANION_CONFIG, offsetof(companionConfig_t, failsafe_policy) },
+    { "companion_allow_rate",      VAR_UINT8  | MASTER_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_OFF_ON }, PG_COMPANION_CONFIG, offsetof(companionConfig_t, allow_offboard_rate) },
+    { "companion_allow_att",       VAR_UINT8  | MASTER_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_OFF_ON }, PG_COMPANION_CONFIG, offsetof(companionConfig_t, allow_offboard_att) },
 #endif
 };
 

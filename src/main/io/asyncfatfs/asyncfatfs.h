@@ -84,6 +84,7 @@ void afatfs_findLast(afatfsFilePtr_t directory);
 
 bool afatfs_flush(void);
 void afatfs_init(void);
+bool afatfs_format(void);
 bool afatfs_destroy(bool dirty);
 void afatfs_poll(void);
 
