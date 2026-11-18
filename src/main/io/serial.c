@@ -358,7 +358,7 @@ void pgResetFn_serialConfig(serialConfig_t *serialConfig)
 #endif
 #endif // USE_VTX
 
-#ifdef MSP_DISPLAYPORT_UART
+#if defined(MSP_DISPLAYPORT_UART) && !defined(VTX_TRAMP_UART) && !defined(VTX_SMARTAUDIO_UART)
     serialPortConfig_t *displayPortUartConfig = serialFindPortConfigurationMutable(MSP_DISPLAYPORT_UART);
     if (displayPortUartConfig) {
         displayPortUartConfig->functionMask = FUNCTION_VTX_MSP | FUNCTION_MSP;
