@@ -51,10 +51,12 @@ PG_REGISTER_WITH_RESET_FN(vtxSettingsConfig_t, vtxSettingsConfig, PG_VTX_SETTING
 void pgResetFn_vtxSettingsConfig(vtxSettingsConfig_t *vtxSettingsConfig)
 {
 #ifdef USE_VTX_TABLE
-    vtxSettingsConfig->band = 0;
-    vtxSettingsConfig->channel = 0;
-    vtxSettingsConfig->power = 0;
-    vtxSettingsConfig->freq = 0;
+    vtxSettingsConfig->band = 5;      // Band R (Raceband)
+    vtxSettingsConfig->channel = 1;   // Channel 1 (5658 MHz)
+    vtxSettingsConfig->power = 2;     // 25mW
+    vtxSettingsConfig->freq = 5658;
+    vtxSettingsConfig->pitModeFreq = 0;
+    vtxSettingsConfig->lowPowerDisarm = 0;
 #else
     vtxSettingsConfig->freq = VTX_TABLE_DEFAULT_FREQ;
     vtxSettingsConfig->band = VTX_TABLE_DEFAULT_BAND;
