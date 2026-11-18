@@ -150,7 +150,8 @@ uint8_t vtxCommonGetVTXPowerLevels(const vtxDevice_t *vtxDevice, uint16_t *level
 
 const char *vtxCommonLookupBandName(const vtxDevice_t *vtxDevice, int band)
 {
-    if (vtxDevice && band > 0 && band <= vtxTableBandCount) {
+    UNUSED(vtxDevice);
+    if (band > 0 && band <= vtxTableBandCount) {
         return vtxTableBandNames[band];
     } else {
         return "?";
@@ -159,7 +160,8 @@ const char *vtxCommonLookupBandName(const vtxDevice_t *vtxDevice, int band)
 
 char vtxCommonLookupBandLetter(const vtxDevice_t *vtxDevice, int band)
 {
-    if (vtxDevice && band > 0 && band <= vtxTableBandCount) {
+    UNUSED(vtxDevice);
+    if (band > 0 && band <= vtxTableBandCount) {
         return vtxTableBandLetters[band];
     } else {
         return '?';
@@ -168,7 +170,8 @@ char vtxCommonLookupBandLetter(const vtxDevice_t *vtxDevice, int band)
 
 const char *vtxCommonLookupChannelName(const vtxDevice_t *vtxDevice, int channel)
 {
-    if (vtxDevice && channel > 0 && channel <= vtxTableChannelCount) {
+    UNUSED(vtxDevice);
+    if (channel > 0 && channel <= vtxTableChannelCount) {
         return vtxTableChannelNames[channel];
     } else {
         return "?";
@@ -179,18 +182,17 @@ const char *vtxCommonLookupChannelName(const vtxDevice_t *vtxDevice, int channel
 //If frequency not found in the vtxtable then band and channel will return 0
 void vtxCommonLookupBandChan(const vtxDevice_t *vtxDevice, uint16_t freq, uint8_t *pBand, uint8_t *pChannel)
 {
+    UNUSED(vtxDevice);
     *pBand = 0;
     *pChannel = 0;
-    if (vtxDevice) {
-        // Use reverse lookup order so that 5880Mhz
-        // get Raceband 7 instead of Fatshark 8.
-        for (int band = vtxTableBandCount - 1 ; band >= 0 ; band--) {
-            for (int channel = 0 ; channel < vtxTableChannelCount ; channel++) {
-                if (vtxTableFrequency[band][channel] == freq) {
-                    *pBand = band + 1;
-                    *pChannel = channel + 1;
-                    return;
-                }
+    // Use reverse lookup order so that 5880Mhz
+    // get Raceband 7 instead of Fatshark 8.
+    for (int band = vtxTableBandCount - 1 ; band >= 0 ; band--) {
+        for (int channel = 0 ; channel < vtxTableChannelCount ; channel++) {
+            if (vtxTableFrequency[band][channel] == freq) {
+                *pBand = band + 1;
+                *pChannel = channel + 1;
+                return;
             }
         }
     }
@@ -202,11 +204,10 @@ void vtxCommonLookupBandChan(const vtxDevice_t *vtxDevice, uint16_t freq, uint8_
 // Returns frequency value (in MHz), or 0 if band/channel out of range.
 uint16_t vtxCommonLookupFrequency(const vtxDevice_t *vtxDevice, int band, int channel)
 {
-    if (vtxDevice) {
-        if (band > 0 && band <= vtxTableBandCount &&
-            channel > 0 && channel <= vtxTableChannelCount) {
-            return vtxTableFrequency[band - 1][channel - 1];
-        }
+    UNUSED(vtxDevice);
+    if (band > 0 && band <= vtxTableBandCount &&
+        channel > 0 && channel <= vtxTableChannelCount) {
+        return vtxTableFrequency[band - 1][channel - 1];
     }
 
     return 0;
@@ -214,7 +215,8 @@ uint16_t vtxCommonLookupFrequency(const vtxDevice_t *vtxDevice, int band, int ch
 
 const char *vtxCommonLookupPowerName(const vtxDevice_t *vtxDevice, int index)
 {
-    if (vtxDevice && index > 0 && index <= vtxTablePowerLevels) {
+    UNUSED(vtxDevice);
+    if (index > 0 && index <= vtxTablePowerLevels) {
         return vtxTablePowerLabels[index];
     } else {
         return "?";
@@ -223,7 +225,8 @@ const char *vtxCommonLookupPowerName(const vtxDevice_t *vtxDevice, int index)
 
 bool vtxCommonLookupPowerValue(const vtxDevice_t *vtxDevice, int index, uint16_t *pPowerValue)
 {
-    if (vtxDevice && index > 0 && index <= vtxTablePowerLevels) {
+    UNUSED(vtxDevice);
+    if (index > 0 && index <= vtxTablePowerLevels) {
         *pPowerValue = vtxTablePowerValues[index - 1];
         return true;
     } else {

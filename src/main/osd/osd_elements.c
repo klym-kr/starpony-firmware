@@ -1076,9 +1076,7 @@ static void osdElementDebug2(osdElementParms_t *element)
 
 static void osdElementDisarmed(osdElementParms_t *element)
 {
-    if (!ARMING_FLAG(ARMED)) {
-        tfp_sprintf(element->buff, "DISARMED");
-    }
+    tfp_sprintf(element->buff, ARMING_FLAG(ARMED) ? "ARMED" : "DISARMED");
 }
 
 static void osdBackgroundPilotName(osdElementParms_t *element)

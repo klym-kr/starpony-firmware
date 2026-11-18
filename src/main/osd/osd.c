@@ -356,7 +356,7 @@ void pgResetFn_osdConfig(osdConfig_t *osdConfig)
     // turn off RSSI & Link Quality warnings by default
     osdWarnSetState(OSD_WARNING_RSSI, false);
     osdWarnSetState(OSD_WARNING_LINK_QUALITY, false);
-    osdWarnSetState(OSD_WARNING_RSSI_DBM, false);
+    osdWarnSetState(OSD_WARNING_RSSI_DBM, true);
     osdWarnSetState(OSD_WARNING_RSNR, false);
     // turn off the over mah capacity warning
     osdWarnSetState(OSD_WARNING_OVER_CAP, false);
@@ -389,7 +389,7 @@ void pgResetFn_osdConfig(osdConfig_t *osdConfig)
     for (int i=0; i < OSD_PROFILE_COUNT; i++) {
         osdConfig->profile[i][0] = '\0';
     }
-    osdConfig->rssi_dbm_alarm = -60;
+    osdConfig->rssi_dbm_alarm = -95;
     osdConfig->rsnr_alarm = 4;
     osdConfig->gps_sats_show_pdop = false;
 
@@ -416,7 +416,7 @@ void pgResetFn_osdConfig(osdConfig_t *osdConfig)
     osdConfig->aux_symbol = 'A';
 
     // Make it obvious on the configurator that the FC doesn't support HD
-#ifdef USE_OSD_HD
+#if defined(USE_OSD_HD) && !defined(USE_OSD_SD) && !defined(USE_MAX7456)
     osdConfig->displayPortDevice = OSD_DISPLAYPORT_DEVICE_MSP;
     osdConfig->canvas_cols = OSD_HD_COLS;
     osdConfig->canvas_rows = OSD_HD_ROWS;
@@ -437,8 +437,8 @@ void pgResetFn_osdConfig(osdConfig_t *osdConfig)
 
 void pgResetFn_osdElementConfig(osdElementConfig_t *osdElementConfig)
 {
-// If user includes OSD_HD in the build assume they want to use it as default
-#ifdef USE_OSD_HD
+// If user includes OSD_HD without SD/MAX7456 assume HD defaults
+#if defined(USE_OSD_HD) && !defined(USE_OSD_SD) && !defined(USE_MAX7456)
     uint8_t midRow = 10;
     uint8_t midCol = 26;
 #else
@@ -456,10 +456,17 @@ void pgResetFn_osdElementConfig(osdElementConfig_t *osdElementConfig)
     for (unsigned i = 1; i <= OSD_PROFILE_COUNT; i++) {
         profileFlags |= OSD_PROFILE_FLAG(i);
     }
-    osdElementConfig->item_pos[OSD_WARNINGS] = OSD_POS((midCol - OSD_WARNINGS_PREFFERED_SIZE / 2), (midRow + 3)) | profileFlags;
 
-    // Default to old fixed positions for these elements
-    osdElementConfig->item_pos[OSD_CROSSHAIRS]         = OSD_POS((midCol - 2), (midRow - 1));
+    // Analog 30x16 HUD layout: right-side telemetry stack + centered crosshair & warnings
+    osdElementConfig->item_pos[OSD_MAIN_BATT_VOLTAGE] = OSD_POS(21, 1) | profileFlags;
+    osdElementConfig->item_pos[OSD_RSSI_DBM_VALUE]    = OSD_POS(21, 2) | profileFlags;
+    osdElementConfig->item_pos[OSD_VTX_CHANNEL]       = OSD_POS(21, 3) | profileFlags;
+    osdElementConfig->item_pos[OSD_FLYMODE]           = OSD_POS(21, 4) | profileFlags;
+    osdElementConfig->item_pos[OSD_DISARMED]          = OSD_POS(21, 5) | profileFlags;
+    osdElementConfig->item_pos[OSD_CROSSHAIRS]        = OSD_POS(13, 7) | profileFlags;
+    osdElementConfig->item_pos[OSD_WARNINGS]          = OSD_POS(9, 9)  | profileFlags;
+
+    // Default to old fixed positions for remaining disabled overlay elements
     osdElementConfig->item_pos[OSD_ARTIFICIAL_HORIZON] = OSD_POS((midCol - 1), (midRow - 5));
     osdElementConfig->item_pos[OSD_HORIZON_SIDEBARS]   = OSD_POS((midCol - 1), (midRow - 1));
     osdElementConfig->item_pos[OSD_CAMERA_FRAME]       = OSD_POS((midCol - 12), (midRow - 6));

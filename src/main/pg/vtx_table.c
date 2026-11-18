@@ -96,6 +96,11 @@ void pgResetFn_vtxTableConfig(vtxTableConfig_t *config)
     config->isFactoryBand[7] = false;
     memcpy(config->frequency[7], bandS, sizeof(bandS));
 
+    // Channel names: "1".."8"
+    for (int channel = 0; channel < VTX_TABLE_MAX_CHANNELS; channel++) {
+        tfp_sprintf(config->channelNames[channel], "%d", channel + 1);
+    }
+
     // Power values: 1 (OFF), 14 (25mW), 27 (500mW), 30 (1000mW = 1W), 34 (2500mW = 2.5W)
     static const uint16_t powerValues[5] = { 1, 14, 27, 30, 34 };
     memcpy(config->powerValues, powerValues, sizeof(powerValues));
