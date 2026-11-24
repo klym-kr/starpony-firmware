@@ -1265,7 +1265,11 @@ void processRxModes(timeUs_t currentTimeUs)
     }
 #endif
 
-    if (FLIGHT_MODE(ANGLE_MODE | ALT_HOLD_MODE | POS_HOLD_MODE | HORIZON_MODE)) {
+    bool highRateAttitude = FLIGHT_MODE(ANGLE_MODE | ALT_HOLD_MODE | POS_HOLD_MODE | HORIZON_MODE | GPS_RESCUE_MODE);
+#ifdef USE_ACRO_TRAINER
+    highRateAttitude = highRateAttitude || pidIsAcroTrainerActive();
+#endif
+    if (highRateAttitude) {
         LED1_ON;
         // increase frequency of attitude task to reduce drift when in angle or horizon mode
         rescheduleTask(TASK_ATTITUDE, TASK_PERIOD_HZ(acc.sampleRateHz / (float)imuConfig()->imu_process_denom));
@@ -1372,12 +1376,8 @@ static FAST_CODE_NOINLINE void subTaskPidController(timeUs_t currentTimeUs)
 #ifdef USE_WING
         airspeedCms = pidGetWingAirspeedCms();
 #endif
-#ifdef USE_GPS
-        if (airspeedCms <= 100.0f && STATE(GPS_FIX)) {
-            airspeedCms = (float)MAX(gpsSol.speed3d, gpsSol.groundSpeed);
-        }
-#endif
     }
+    ladrcSetFixedWing(isFixedWing());
     ladrcSetExternalB0Scale(ladrcComputeB0Scale(ladrcProfiles(profileIndex), effectiveVbatRatio, airspeedCms, isFixedWing()));
     if (ARMING_FLAG(ARMED)) {
         const float gyroPeak = fmaxf(fabsf(gyro.gyroADCf[FD_ROLL]), fmaxf(fabsf(gyro.gyroADCf[FD_PITCH]), fabsf(gyro.gyroADCf[FD_YAW])));
@@ -1575,7 +1575,7 @@ FAST_CODE bool pidLoopReady(void)
 FAST_CODE void taskFiltering(timeUs_t currentTimeUs)
 {
 #ifdef USE_DSHOT_TELEMETRY
-    updateDshotTelemetry();  // decode and update Dshot telemetry
+    updateDshotTelemetry(currentTimeUs);  // decode and update Dshot telemetry
 #endif
     gyroFiltering(currentTimeUs);
 }

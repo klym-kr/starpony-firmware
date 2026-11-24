@@ -25,6 +25,7 @@
 
 #include "platform.h"
 
+#include "common/axis.h"
 #include "common/time.h"
 
 #include "pg/pg.h"
@@ -152,6 +153,7 @@ bool isFixedWing(void);
 
 float getMotorOutputLow(void);
 float getMotorOutputHigh(void);
+void mixerProjectMotorOutputsToAxes(const float *motorOutputs, const motorMixer_t *mixer, uint8_t motorCount, float axesOut[XYZ_AXIS_COUNT]);
 
 #ifdef USE_WING
 float getMotorOutputRms(void);

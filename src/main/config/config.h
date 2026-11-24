@@ -67,6 +67,7 @@ void setConfigDirty(void);
 bool isConfigDirty(void);
 
 uint8_t getCurrentPidProfileIndex(void);
+void indiRefreshRuntimeRatesAndFilters(void);
 void changePidProfile(uint8_t pidProfileIndex);
 void changePidProfileFromCellCount(uint8_t cellCount);
 

@@ -29,8 +29,11 @@
 #include "common/filter.h"
 #include "common/maths.h"
 
+#include "config/config.h"
+
 #include "drivers/dshot.h"
 
+#include "flight/ladrc.h"
 #include "flight/mixer.h"
 #include "flight/pid.h"
 
@@ -76,21 +79,39 @@ void rpmFilterInit(const rpmFilterConfig_t *config, const timeUs_t looptimeUs)
         return;
     }
 
-    // if RPM Filtering is configured to be off
-    if (!config->rpm_filter_harmonics) {
-        return;
-    }
+#ifdef USE_LADRC
+    const ladrcProfile_t *ladrcProfile = ladrcProfiles(systemConfig()->pidProfileIndex);
+    if (!ladrcProfile->manual_override) {
+        rpmFilter.numHarmonics = 2;
+        rpmFilter.minHz = indiComputeRpmMinHz(ladrcProfile);
+        rpmFilter.maxHz = 0.48f * 1e6f / looptimeUs;
+        rpmFilter.fadeRangeHz = (config->rpm_filter_fade_range_hz > 0) ? config->rpm_filter_fade_range_hz : 50;
+        rpmFilter.q = (config->rpm_filter_q > 0) ? (config->rpm_filter_q / 100.0f) : 5.0f;
+        rpmFilter.dt = looptimeUs * 1e-6f;
+        rpmFilter.weights[0] = 1.0f;
+        rpmFilter.weights[1] = 1.0f;
+        for (int n = 2; n < RPM_FILTER_HARMONICS_MAX; n++) {
+            rpmFilter.weights[n] = 0.0f;
+        }
+    } else
+#endif
+    {
+        // if RPM Filtering is configured to be off
+        if (!config->rpm_filter_harmonics) {
+            return;
+        }
 
-    // if we get to this point, enable and init RPM filtering
-    rpmFilter.numHarmonics = config->rpm_filter_harmonics;
-    rpmFilter.minHz = config->rpm_filter_min_hz;
-    rpmFilter.maxHz = 0.48f * 1e6f / looptimeUs; // don't go quite to nyquist to avoid oscillations
-    rpmFilter.fadeRangeHz = config->rpm_filter_fade_range_hz;
-    rpmFilter.q = config->rpm_filter_q / 100.0f;
-    rpmFilter.dt = looptimeUs * 1e-6f;
+        // if we get to this point, enable and init RPM filtering
+        rpmFilter.numHarmonics = config->rpm_filter_harmonics;
+        rpmFilter.minHz = config->rpm_filter_min_hz;
+        rpmFilter.maxHz = 0.48f * 1e6f / looptimeUs; // don't go quite to nyquist to avoid oscillations
+        rpmFilter.fadeRangeHz = config->rpm_filter_fade_range_hz;
+        rpmFilter.q = config->rpm_filter_q / 100.0f;
+        rpmFilter.dt = looptimeUs * 1e-6f;
 
-    for (int n = 0; n < RPM_FILTER_HARMONICS_MAX; n++) {
-        rpmFilter.weights[n] = constrainf(config->rpm_filter_weights[n] / 100.0f, 0.0f, 1.0f);
+        for (int n = 0; n < RPM_FILTER_HARMONICS_MAX; n++) {
+            rpmFilter.weights[n] = constrainf(config->rpm_filter_weights[n] / 100.0f, 0.0f, 1.0f);
+        }
     }
 
     for (int motor = 0; motor < getMotorCount(); motor++) {

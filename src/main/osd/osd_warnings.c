@@ -48,6 +48,9 @@
 #include "flight/failsafe.h"
 #include "flight/gps_rescue.h"
 #include "flight/imu.h"
+#ifdef USE_LADRC
+#include "flight/ladrc.h"
+#endif
 #include "flight/mixer.h"
 #include "flight/mixer_init.h"
 #include "flight/pid.h"
@@ -503,6 +506,14 @@ void renderOsdWarning(char *warningText, bool *blinking, uint8_t *displayAttr)
         return;
     }
 #endif // USE_BATTERY_CONTINUE
+
+#ifdef USE_LADRC
+    if (!ARMING_FLAG(ARMED) && indiIsDshotWarningActive()) {
+        tfp_sprintf(warningText, "NO DSHOT RPM (INDI FALLBACK)");
+        *displayAttr = DISPLAYPORT_SEVERITY_WARNING;
+        return;
+    }
+#endif
 
     // Show warning if battery is not fresh
     if (osdWarnGetState(OSD_WARNING_BATTERY_NOT_FULL) && !(ARMING_FLAG(ARMED) || ARMING_FLAG(WAS_EVER_ARMED)) && (getBatteryState() == BATTERY_OK)

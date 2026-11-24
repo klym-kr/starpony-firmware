@@ -320,6 +320,7 @@ TEST(pidControllerTest, testPidLevel)
 {
     // Make sure to start with fresh values
     resetTest();
+    ladrcProfilesMutable(systemConfig()->pidProfileIndex)->manual_override = 1;
     ENABLE_ARMING_FLAG(ARMED);
     pidStabilisationState(PID_STABILISATION_ON);
 
@@ -778,6 +779,7 @@ TEST(pidControllerTest, testCrashRecoveryResetsDisturbanceAndBypassesTd)
     // Subsequent step after post-mixer update during crash recovery continues D-term damping while keeping disturbance reset
     ladrcPostMixerUpdate(1.0f, true);
     EXPECT_GT(stRoll->z2, 0.0f);
+    gyro.gyroADCf[FD_ROLL] = 1200.0f;
     pidController(pidProfile, currentTestTime() + 2000000);
     EXPECT_FLOAT_EQ(0.0f, pidData[FD_ROLL].I);
     EXPECT_FLOAT_EQ(0.0f, stRoll->z3);
@@ -796,23 +798,55 @@ TEST(pidControllerTest, testAcroTrainerResetsDisturbanceWhilePreservingDamping)
     sensorsSet(SENSOR_ACC);
     pidSetAcroTrainerState(true);
 
-    // Build disturbance on roll first
+    // Build disturbance trim on roll first
     setStickPosition(FD_ROLL, 0.3f);
     for (int i = 0; i < 40; i++) {
         pidController(pidProfile, currentTestTime());
         ladrcPostMixerUpdate(1.0f, true);
     }
-    EXPECT_GT(fabsf(pidData[FD_ROLL].I), 0.5f);
+    const float preTrimI = pidData[FD_ROLL].I;
+    EXPECT_GT(fabsf(preTrimI), 0.5f);
 
-    // Exceed angle limit in stick direction with active gyro rate -> Acro Trainer resets disturbance (I/z3 = 0) while keeping D-term damping!
+    // Exceed angle limit in stick direction with active gyro rate -> Acro Trainer shapes setpoint
+    // while preserving both D-term damping and non-zero disturbance/I trim!
     attitude.values.roll = 300; // 30 deg > 20 deg limit
     gyro.gyroADCf[FD_ROLL] = 200.0f;
     pidController(pidProfile, currentTestTime());
     const ladrcRuntimeAxis_t *stRoll = ladrcGetAxisState(FD_ROLL);
     ASSERT_NE(stRoll, nullptr);
-    EXPECT_FLOAT_EQ(0.0f, pidData[FD_ROLL].I);
-    EXPECT_FLOAT_EQ(0.0f, stRoll->z3);
+    EXPECT_LT(pidRuntime.previousPidSetpoint[FD_ROLL], 0.0f);
+    EXPECT_GT(fabsf(pidData[FD_ROLL].I), 0.5f);
+    EXPECT_NEAR(stRoll->distTermSum, pidData[FD_ROLL].I, 1e-3f);
     EXPECT_GT(stRoll->z2, 0.0f);
     EXPECT_LT(pidData[FD_ROLL].D, 0.0f);
     pidSetAcroTrainerState(false);
+}
+
+TEST(pidControllerTest, testIndiAutoAngleGainAndDtermFilterBypass)
+{
+    resetTest();
+    gyro.targetLooptime = 500; // 2 kHz PID loop so 100Hz/260Hz legacy filters are below Nyquist
+    // 4-Param Auto INDI (manual_override == 0):
+    // 5.0" default -> wc_roll = 18.0 -> K_angle = 4.5 deg/s/deg, and legacy D-term filters bypassed to nullFilterApply
+    ladrcProfile_t *ladrcProf = ladrcProfilesMutable(systemConfig()->pidProfileIndex);
+    ladrcProf->prop_size_deci_in = 50;
+    ladrcProf->agility_pct = 100;
+    ladrcProf->manual_override = 0;
+    pidInit(pidProfile);
+    EXPECT_NEAR(indiGetAngleGain(), 4.5f, 1e-4f);
+    EXPECT_EQ(pidRuntime.dtermLowpassApplyFn, nullFilterApply);
+    EXPECT_EQ(pidRuntime.dtermLowpass2ApplyFn, nullFilterApply);
+    EXPECT_EQ(pidRuntime.dtermNotchApplyFn, nullFilterApply);
+    EXPECT_EQ(pidRuntime.ptermYawLowpassApplyFn, nullFilterApply);
+
+    // 20.0" prop -> wc_roll = 9.0 -> K_angle = 2.25 deg/s/deg
+    ladrcProf->prop_size_deci_in = 200;
+    pidInit(pidProfile);
+    EXPECT_NEAR(indiGetAngleGain(), 2.25f, 1e-4f);
+
+    // Manual override re-enables legacy D-term filters
+    ladrcProf->manual_override = 1;
+    pidInit(pidProfile);
+    EXPECT_NE(pidRuntime.dtermLowpassApplyFn, nullFilterApply);
+    EXPECT_NE(pidRuntime.dtermNotchApplyFn, nullFilterApply);
 }

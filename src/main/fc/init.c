@@ -102,6 +102,7 @@
 #include "flight/flight_plan_nav.h"
 #endif
 #include "flight/imu.h"
+#include "flight/ladrc.h"
 #include "flight/mixer.h"
 #include "flight/gps_rescue.h"
 #include "flight/pid.h"
@@ -744,6 +745,9 @@ void initPhase3(void)
     companionLinkInit();
 #endif
 
+#ifdef USE_LADRC
+    ladrcSetFixedWing(isFixedWing());
+#endif
     pidInit(currentPidProfile);
 
     mixerInitProfile();

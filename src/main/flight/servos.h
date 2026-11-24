@@ -136,6 +136,8 @@ typedef struct servoProfile_s {
 extern int16_t servo[MAX_SUPPORTED_SERVOS];
 
 bool isMixerUsingServos(void);
+bool servoHasStabilizedAxis(int axis);
+float servoGetRealizedAxisNorm(int axis, float fallbackNorm);
 void writeServos(void);
 void servoMixerLoadMix(int index);
 void loadCustomServoMixer(void);

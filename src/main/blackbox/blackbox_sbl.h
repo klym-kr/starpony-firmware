@@ -37,6 +37,10 @@
 #define SBL_RESET_SATURATED_BIT     (1U << 6)
 #define SBL_RESET_STABILISED_BIT    (1U << 7)
 
+#define SBL_HDR_FLAG_MANUAL_OVERRIDE (1U << 0)
+#define SBL_HDR_FLAG_DSHOT_FEEDBACK  (1U << 1)
+#define SBL_HDR_FLAG_HAS_INDI_META   (1U << 7)
+
 #define SBL_MAX_MOTORS              8U
 
 typedef enum {
@@ -97,6 +101,10 @@ typedef struct __attribute__((packed)) sblSessionHeader_s {
     char     boardInfo[16];
     char     fwRevision[24];
     char     startDatetime[20];
+    uint16_t propSizeDeciIn;
+    uint16_t auwCentiKg;
+    uint16_t agilityPct;
+    uint16_t authorityTrimPct;
 } sblSessionHeader_t;
 
 typedef struct __attribute__((packed)) sblFrameFullHead_s {

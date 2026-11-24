@@ -69,6 +69,8 @@ extern "C" {
         { .name = "array_unit_test",   .type = VAR_INT8  | MODE_ARRAY  | MASTER_VALUE, .config = { .array = { .length = 3}},                     .pgn = PG_RESERVED_FOR_TESTING_1, .offset = 0 },
         { .name = "str_unit_test",     .type = VAR_UINT8 | MODE_STRING | MASTER_VALUE, .config = { .string = { 0, 16, 0 }},                      .pgn = PG_RESERVED_FOR_TESTING_1, .offset = 0 },
         { .name = "wos_unit_test",     .type = VAR_UINT8 | MODE_STRING | MASTER_VALUE, .config = { .string = { 0, 16, STRING_FLAGS_WRITEONCE }}, .pgn = PG_RESERVED_FOR_TESTING_1, .offset = 0 },
+        { .name = "scale10_unit_test", .type = VAR_UINT16 | MASTER_VALUE | VALUE_SCALE_10,  .config = { .minmaxUnsigned = { 30, 300 } },           .pgn = PG_RESERVED_FOR_TESTING_2, .offset = 0 },
+        { .name = "scale100_unit_test",.type = VAR_UINT16 | MASTER_VALUE | VALUE_SCALE_100, .config = { .minmaxUnsigned = { 20, 5000 } },          .pgn = PG_RESERVED_FOR_TESTING_2, .offset = sizeof(uint16_t) },
     };
     const uint16_t valueTableEntryCount = ARRAYLEN(valueTable);
     const lookupTableEntry_t lookupTables[] = {};
@@ -101,6 +103,8 @@ extern "C" {
     PG_REGISTER(gpsRescueConfig_t, gpsRescueConfig, PG_GPS_RESCUE, 0);
 
     PG_REGISTER_WITH_RESET_FN(int8_t, unitTestData, PG_RESERVED_FOR_TESTING_1, 0);
+    PG_DECLARE_ARRAY(uint16_t, 2, unitTestScaleData);
+    PG_REGISTER_ARRAY(uint16_t, 2, unitTestScaleData, PG_RESERVED_FOR_TESTING_2, 0);
 }
 
 #include "unittest_macros.h"
@@ -659,4 +663,32 @@ TEST(CLIUnittest, TestCliHelpNullDescription)
 
     // If we reach here without a crash/SIGSEGV the null guard is working.
     SUCCEED();
+}
+
+TEST(CLIUnittest, TestCliDecimalScaledSettings)
+{
+    char setProp[] = "scale10_unit_test = 5.0";
+    cliSet("", setProp);
+    EXPECT_EQ(50U, unitTestScaleData(0)[0]);
+
+    char setWeight[] = "scale100_unit_test = 0.65";
+    cliSet("", setWeight);
+    EXPECT_EQ(65U, unitTestScaleData(0)[1]);
+
+    char buf[64];
+    int written = cliGetSettingByName("scale10_unit_test", buf, sizeof(buf));
+    ASSERT_GT(written, 0);
+    buf[written] = '\0';
+    EXPECT_STREQ("scale10_unit_test = 5.0", buf);
+
+    written = cliGetSettingByName("scale100_unit_test", buf, sizeof(buf));
+    ASSERT_GT(written, 0);
+    buf[written] = '\0';
+    EXPECT_STREQ("scale100_unit_test = 0.65", buf);
+
+    EXPECT_TRUE(cliSetSettingByName("scale10_unit_test = 20.5"));
+    EXPECT_EQ(205U, unitTestScaleData(0)[0]);
+    EXPECT_TRUE(cliSetSettingByName("scale100_unit_test = 8.25"));
+    EXPECT_EQ(825U, unitTestScaleData(0)[1]);
+    EXPECT_FALSE(cliSetSettingByName("scale10_unit_test = 2.5")); // below min 3.0
 }

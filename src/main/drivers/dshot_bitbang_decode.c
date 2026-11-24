@@ -215,12 +215,18 @@ uint32_t decode_bb_bitband( uint16_t buffer[], uint32_t count, uint32_t bit)
 
     // length of last sequence has to be inferred since the last bit with inverted dshot is high
     if (bits < 18) {
+        if (preambleSkip > 0) {
+            preambleSkip--;
+        }
         return DSHOT_TELEMETRY_NOEDGE;
     }
 
     // length of last sequence has to be inferred since the last bit with inverted dshot is high
     const int nlen = 21 - bits;
     if (nlen < 0) {
+        if (preambleSkip > 0) {
+            preambleSkip--;
+        }
         return DSHOT_TELEMETRY_NOEDGE;
     }
 
@@ -346,12 +352,18 @@ FAST_CODE uint32_t decode_bb( uint16_t buffer[], uint32_t count, uint32_t bit)
 
     // length of last sequence has to be inferred since the last bit with inverted dshot is high
     if (bits < 18) {
+        if (preambleSkip > 0) {
+            preambleSkip--;
+        }
         return DSHOT_TELEMETRY_NOEDGE;
     }
 
     // length of last sequence has to be inferred since the last bit with inverted dshot is high
     const int nlen = 21 - bits;
     if (nlen < 0) {
+        if (preambleSkip > 0) {
+            preambleSkip--;
+        }
         return DSHOT_TELEMETRY_NOEDGE;
     }
 

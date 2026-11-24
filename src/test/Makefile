@@ -303,7 +303,8 @@ osd_unittest_DEFINES := \
 		USE_OSD= \
 		USE_GPS= \
 		USE_RTC_TIME= \
-		USE_ADC_INTERNAL=
+		USE_ADC_INTERNAL= \
+		USE_LADRC=
 
 link_quality_unittest_SRC := \
 		$(USER_DIR)/osd/osd.c \
@@ -566,6 +567,7 @@ pid_unittest_DEFINES := \
 
 ladrc_unittest_SRC := \
 		$(USER_DIR)/common/crc.c \
+		$(USER_DIR)/common/filter.c \
 		$(USER_DIR)/common/maths.c \
 		$(USER_DIR)/common/streambuf.c \
 		$(USER_DIR)/flight/ladrc.c \

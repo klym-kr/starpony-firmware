@@ -188,9 +188,18 @@ FAST_CODE void svfLowpassFilterUpdate(svfLowpassFilter_t *filter, float filterFr
     filter->f = f;
 }
 
-// Computes a SVF filter in TPT form on a sample
-FAST_CODE float svfLowpassFilterApply(svfLowpassFilter_t *filter, float input)
+// Computes a SVF filter in TPT form on a sample, optionally outputting bandpass node v1
+FAST_CODE float svfLowpassFilterApplyWithBandpass(svfLowpassFilter_t *filter, float input, float *bpOut)
 {
+    if (!floatIsFiniteBits(input)) {
+        filter->ic1 = 0.0f;
+        filter->ic2 = 0.0f;
+        if (bpOut) {
+            *bpOut = 0.0f;
+        }
+        return 0.0f;
+    }
+
     const float a1 = filter->a1;
     const float a2 = filter->a2;
     const float f = filter->f;
@@ -201,10 +210,28 @@ FAST_CODE float svfLowpassFilterApply(svfLowpassFilter_t *filter, float input)
     const float v1 = a1 * ic1 + a2 * v3;
     const float v2 = ic2 + f * v1;
 
+    if (!floatIsFiniteBits(v2)) {
+        filter->ic1 = 0.0f;
+        filter->ic2 = 0.0f;
+        if (bpOut) {
+            *bpOut = 0.0f;
+        }
+        return 0.0f;
+    }
+
+    if (bpOut) {
+        *bpOut = v1;
+    }
+
     filter->ic1 = 2.0f * v1 - ic1;
     filter->ic2 = 2.0f * v2 - ic2;
 
     return v2;
+}
+
+FAST_CODE float svfLowpassFilterApply(svfLowpassFilter_t *filter, float input)
+{
+    return svfLowpassFilterApplyWithBandpass(filter, input, NULL);
 }
 
 void svfNotchInit(svfNotchFilter_t *filter, float filterFreq, float dt, float Q)

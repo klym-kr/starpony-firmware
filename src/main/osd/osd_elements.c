@@ -2026,6 +2026,12 @@ static void osdElementWarnings(osdElementParms_t *element)
         CLR_BLINK(OSD_WARNINGS);
     }
 
+    const size_t msgLen = strlen(element->buff);
+    const uint8_t cols = (element->osdDisplayPort && element->osdDisplayPort->cols > 0) ? element->osdDisplayPort->cols : 30;
+    if (msgLen > 0 && (size_t)element->elemPosX + msgLen > cols) {
+        element->elemPosX = (msgLen < cols) ? (uint8_t)(cols - msgLen) : 0;
+    }
+
 #ifdef USE_CRAFTNAME_MSGS
     // Injects data into the CraftName variable for systems which limit
     // the available MSP data field in their OSD.

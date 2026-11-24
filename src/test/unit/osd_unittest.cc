@@ -111,6 +111,7 @@ extern "C" {
     int32_t simulationVerticalSpeed;
     uint16_t simulationCoreTemperature;
     bool simulationGpsHealthy;
+    bool simulationIndiDshotWarning = false;
 }
 
 uint32_t simulationFeatureFlags = FEATURE_GPS;
@@ -145,6 +146,7 @@ void setDefaultSimulationState()
     simulationVerticalSpeed = 0;
     simulationCoreTemperature = 0;
     simulationGpsHealthy = false;
+    simulationIndiDshotWarning = false;
 
     rcData[PITCH] = 1500;
 
@@ -1506,6 +1508,27 @@ TEST_F(OsdTest, TestBatteryUsageCapacityZero)
     
 }
 
+TEST_F(OsdTest, TestElementWarningsIndiDshotFallbackAndAnalogShift)
+{
+    // Position OSD_WARNINGS at x=15 on a 30-col analog OSD:
+    // "NO DSHOT RPM (INDI FALLBACK)" is 28 chars, so x shifts left to 30 - 28 = 2
+    osdElementConfigMutable()->item_pos[OSD_WARNINGS] = OSD_POS(15, 10) | OSD_PROFILE_1_FLAG;
+    osdConfigMutable()->enabledWarnings = 0;
+    osdAnalyzeActiveElements();
+
+    simulationIndiDshotWarning = true;
+    DISABLE_ARMING_FLAG(ARMED);
+    displayClearScreen(&testDisplayPort, DISPLAY_CLEAR_WAIT);
+    osdRefresh();
+    displayPortTestBufferSubstring(2, 10, "NO DSHOT RPM (INDI FALLBACK)");
+
+    // Must not show when armed
+    doTestArm(false);
+    displayClearScreen(&testDisplayPort, DISPLAY_CLEAR_WAIT);
+    osdRefresh();
+    displayPortTestBufferSubstring(2, 10, "                            ");
+}
+
 // STUBS
 extern "C" {
     bool featureIsEnabled(uint32_t f) { return simulationFeatureFlags & f; }
@@ -1642,4 +1665,5 @@ extern "C" {
     void schedulerIgnoreTaskExecTime(void) { }
     bool schedulerGetIgnoreTaskExecTime() { return false; }
     void schedulerSetNextStateTime(timeDelta_t) {}
+    bool indiIsDshotWarningActive(void) { return simulationIndiDshotWarning; }
 }

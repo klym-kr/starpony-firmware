@@ -66,6 +66,10 @@
 
 #include "sensors/battery.h"
 #include "sensors/gyro.h"
+#ifndef UNIT_TEST
+#include "flight/dyn_notch_filter.h"
+#include "sensors/gyro_init.h"
+#endif
 
 #if !defined(DEFAULT_BLACKBOX_DEVICE)
 #define DEFAULT_BLACKBOX_DEVICE BLACKBOX_DEVICE_NONE
@@ -83,7 +87,7 @@ PG_RESET_TEMPLATE(blackboxConfig_t, blackboxConfig,
 
 STATIC_ASSERT((sizeof(blackboxConfig()->fields_disabled_mask) * 8) >= FLIGHT_LOG_FIELD_SELECT_COUNT, too_many_flight_log_fields_selections);
 STATIC_ASSERT(sizeof(sblChunkHdr_t) == 8, sbl_chunk_hdr_size);
-STATIC_ASSERT(sizeof(sblSessionHeader_t) == 152, sbl_session_hdr_size);
+STATIC_ASSERT(sizeof(sblSessionHeader_t) == 160, sbl_session_hdr_size);
 STATIC_ASSERT(sizeof(sblFrameFullHead_t) == 74, sbl_full_frame_head_size);
 STATIC_ASSERT(sizeof(sblFrameCompactHead_t) == 50, sbl_compact_frame_head_size);
 STATIC_ASSERT(sizeof(sblEventPayload_t) == 16, sbl_event_size);
@@ -305,8 +309,21 @@ static void sblPopulateSessionHeader(sblSessionHeader_t *hdr)
         hdr->antiWindup = ladrc->anti_windup;
         hdr->vbatB0Comp = ladrc->vbat_b0_comp;
         hdr->airspeedSched = ladrc->airspeed_sched;
+        hdr->reserved0 = SBL_HDR_FLAG_HAS_INDI_META;
+        if (ladrc->manual_override) {
+            hdr->reserved0 |= SBL_HDR_FLAG_MANUAL_OVERRIDE;
+        }
+#ifndef UNIT_TEST
+        if (indiGetFeedbackMode() == INDI_FEEDBACK_DSHOT_RPM) {
+            hdr->reserved0 |= SBL_HDR_FLAG_DSHOT_FEEDBACK;
+        }
+#endif
         hdr->airspeedRefCms = ladrc->airspeed_ref_cms;
         hdr->distLimitPermille = ladrc->disturbance_limit;
+        hdr->propSizeDeciIn = ladrc->prop_size_deci_in;
+        hdr->auwCentiKg = ladrc->auw_centi_kg;
+        hdr->agilityPct = ladrc->agility_pct;
+        hdr->authorityTrimPct = ladrc->authority_trim_pct;
         for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
             hdr->axis[axis].order = ladrc->axis[axis].order;
             hdr->axis[axis].wcDeci = ladrc->axis[axis].wc_deci;
@@ -316,17 +333,39 @@ static void sblPopulateSessionHeader(sblSessionHeader_t *hdr)
         }
     }
 
-    hdr->gyroLpf1StaticHz = gyroConfig()->gyro_lpf1_static_hz;
+#ifndef UNIT_TEST
+    if (ladrc && !ladrc->manual_override) {
+        hdr->gyroLpf1StaticHz = gyroGetActiveLpf1Hz();
 #ifdef USE_DYN_LPF
-    hdr->gyroLpf1DynMinHz = gyroConfig()->gyro_lpf1_dyn_min_hz;
-    hdr->gyroLpf1DynMaxHz = gyroConfig()->gyro_lpf1_dyn_max_hz;
+        if (gyro.dynLpfFilter != DYN_LPF_NONE) {
+            hdr->gyroLpf1DynMinHz = gyro.dynLpfMin;
+            hdr->gyroLpf1DynMaxHz = gyro.dynLpfMax;
+        } else {
+            hdr->gyroLpf1DynMinHz = 0;
+            hdr->gyroLpf1DynMaxHz = 0;
+        }
 #endif
-    hdr->gyroLpf2StaticHz = gyroConfig()->gyro_lpf2_static_hz;
+        hdr->gyroLpf2StaticHz = gyroGetActiveLpf2Hz();
 #ifdef USE_DYN_NOTCH_FILTER
-    hdr->dynNotchCount = dynNotchConfig()->dyn_notch_count;
-    hdr->dynNotchMinHz = dynNotchConfig()->dyn_notch_min_hz;
-    hdr->dynNotchMaxHz = dynNotchConfig()->dyn_notch_max_hz;
+        hdr->dynNotchCount = dynNotchGetActiveCount();
+        hdr->dynNotchMinHz = dynNotchGetMinHz();
+        hdr->dynNotchMaxHz = dynNotchGetMaxHz();
 #endif
+    } else
+#endif
+    {
+        hdr->gyroLpf1StaticHz = gyroConfig()->gyro_lpf1_static_hz;
+#ifdef USE_DYN_LPF
+        hdr->gyroLpf1DynMinHz = gyroConfig()->gyro_lpf1_dyn_min_hz;
+        hdr->gyroLpf1DynMaxHz = gyroConfig()->gyro_lpf1_dyn_max_hz;
+#endif
+        hdr->gyroLpf2StaticHz = gyroConfig()->gyro_lpf2_static_hz;
+#ifdef USE_DYN_NOTCH_FILTER
+        hdr->dynNotchCount = dynNotchConfig()->dyn_notch_count;
+        hdr->dynNotchMinHz = dynNotchConfig()->dyn_notch_min_hz;
+        hdr->dynNotchMaxHz = dynNotchConfig()->dyn_notch_max_hz;
+#endif
+    }
 
     sblCopyFixedStr(hdr->craftName, sizeof(hdr->craftName), pilotConfig()->craftName);
 

@@ -47,6 +47,10 @@
 #include "rx/rx.h"
 
 #include "sensors/gyro.h"
+#ifndef UNIT_TEST
+#include "flight/mixer.h"
+#include "sensors/gyro_init.h"
+#endif
 #include "sensors/sensors.h"
 
 #include "pid_init.h"
@@ -143,6 +147,12 @@ void pidInitFilters(const pidProfile_t *pidProfile)
         return;
     }
 
+#ifdef USE_LADRC
+    const bool bypassLegacyDtermFilters = !ladrcProfiles(systemConfig()->pidProfileIndex)->manual_override;
+#else
+    const bool bypassLegacyDtermFilters = false;
+#endif
+
     // limit to 95% of the nyquist to help with stability
     const uint32_t pidFrequencyNyquist = (pidRuntime.pidFrequency / 2.0f) * 0.95f;
 
@@ -157,7 +167,7 @@ void pidInitFilters(const pidProfile_t *pidProfile)
         }
     }
 
-    if (dTermNotchHz != 0 && pidProfile->dterm_notch_cutoff != 0) {
+    if (!bypassLegacyDtermFilters && dTermNotchHz != 0 && pidProfile->dterm_notch_cutoff != 0) {
         pidRuntime.dtermNotchApplyFn = (filterApplyFnPtr)svfNotchApply;
         const float notchQ = filterGetNotchQ(dTermNotchHz, pidProfile->dterm_notch_cutoff);
         for (int axis = FD_ROLL; axis <= FD_YAW; axis++) {
@@ -176,7 +186,7 @@ void pidInitFilters(const pidProfile_t *pidProfile)
     }
 #endif
 
-    if (dterm_lpf1_init_hz > 0) {
+    if (!bypassLegacyDtermFilters && dterm_lpf1_init_hz > 0) {
         switch (pidProfile->dterm_lpf1_type) {
         case FILTER_PT1:
             pidRuntime.dtermLowpassApplyFn = (filterApplyFnPtr)pt1FilterApply;
@@ -215,7 +225,7 @@ void pidInitFilters(const pidProfile_t *pidProfile)
     }
 
     //2nd Dterm Lowpass Filter
-    if (pidProfile->dterm_lpf2_static_hz > 0) {
+    if (!bypassLegacyDtermFilters && pidProfile->dterm_lpf2_static_hz > 0) {
         switch (pidProfile->dterm_lpf2_type) {
         case FILTER_PT1:
             pidRuntime.dtermLowpass2ApplyFn = (filterApplyFnPtr)pt1FilterApply;
@@ -253,7 +263,7 @@ void pidInitFilters(const pidProfile_t *pidProfile)
         pidRuntime.dtermLowpass2ApplyFn = nullFilterApply;
     }
 
-    if (pidProfile->yaw_lowpass_hz == 0) {
+    if (bypassLegacyDtermFilters || pidProfile->yaw_lowpass_hz == 0) {
         pidRuntime.ptermYawLowpassApplyFn = nullFilterApply;
     } else {
         pidRuntime.ptermYawLowpassApplyFn = (filterApplyFnPtr)pt1FilterApply;
@@ -367,6 +377,11 @@ void pidInit(const pidProfile_t *pidProfile)
     pidInitConfig(pidProfile);
 #ifdef USE_LADRC
     ladrcInit(systemConfig()->pidProfileIndex, pidRuntime.dT);
+#ifndef UNIT_TEST
+    const bool dshotActive = motorConfig()->dev.useDshotTelemetry && !isFixedWing();
+    const float actuatorPipeDelayS = dshotActive ? (3.0f * pidRuntime.dT) : pidRuntime.dT;
+    ladrcSetUpstreamSyncDelayS(MAX(0.0f, gyroComputeUpstreamDelayS() - actuatorPipeDelayS));
+#endif
 #endif
 #ifdef USE_ADVANCED_TPA
     tpaCurveInit(pidProfile);

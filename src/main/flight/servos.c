@@ -36,6 +36,7 @@
 #include "config/config_reset.h"
 #include "config/feature.h"
 
+#include "drivers/motor.h"
 #include "drivers/pwm_output.h"
 
 #include "fc/rc_controls.h"
@@ -116,6 +117,7 @@ int16_t servo[MAX_SUPPORTED_SERVOS];
 static uint8_t servoRuleCount = 0;
 static servoMixer_t currentServoMixer[MAX_SERVO_RULES];
 static int useServo;
+static float servoRealizedScale[XYZ_AXIS_COUNT] = { 1.0f, 1.0f, 1.0f };
 
 #define COUNT_SERVO_RULES(rules) (sizeof(rules) / sizeof(servoMixer_t))
 // mixer rule format servo, input, rate, speed, min, max, box
@@ -306,6 +308,9 @@ void servosInit(void)
     for (uint8_t i = 0; i < MAX_SUPPORTED_SERVOS; i++) {
         servo[i] = DEFAULT_SERVO_MIDDLE;
     }
+    for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
+        servoRealizedScale[axis] = 1.0f;
+    }
 
     if (mixerIsTricopter()) {
         servosTricopterInit();
@@ -355,13 +360,55 @@ static void updateGimbalServos(uint8_t firstServoIndex)
     writeServoWithTracking(firstServoIndex + 1, SERVO_GIMBAL_ROLL);
 }
 
-static void servoTable(void);
+static void servoTable(int16_t *preClampOut, int16_t *midOut);
 static void filterServos(void);
+
+static void updateServoRealizedAxisScales(const int16_t *preClamp, const int16_t *mid)
+{
+    float servoClipRatio[MAX_SUPPORTED_SERVOS];
+    for (int i = 0; i < MAX_SUPPORTED_SERVOS; i++) {
+        const int32_t denom = (int32_t)preClamp[i] - (int32_t)mid[i];
+        if (denom > 1 || denom < -1) {
+            const float ratio = (float)((int32_t)servo[i] - (int32_t)mid[i]) / (float)denom;
+            servoClipRatio[i] = constrainf(ratio, 0.0f, 1.0f);
+        } else {
+            servoClipRatio[i] = 1.0f;
+        }
+    }
+
+    for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
+        if (mixerIsTricopter() && axis == FD_YAW) {
+            servoRealizedScale[FD_YAW] = servoClipRatio[SERVO_RUDDER];
+            continue;
+        }
+        float weightedSum = 0.0f;
+        float totalWeight = 0.0f;
+        const uint8_t source = (uint8_t)(INPUT_STABILIZED_ROLL + axis);
+        for (int i = 0; i < servoRuleCount; i++) {
+            if ((currentServoMixer[i].box == 0 || IS_RC_MODE_ACTIVE(BOXSERVO1 + currentServoMixer[i].box - 1))
+                && currentServoMixer[i].inputSource == source
+                && currentServoMixer[i].rate != 0) {
+                const uint8_t target = currentServoMixer[i].targetChannel;
+                if (target < MAX_SUPPORTED_SERVOS) {
+                    const float w = fabsf((float)currentServoMixer[i].rate * (float)servoParams(target)->rate);
+                    if (w > 0.0f) {
+                        weightedSum += w * servoClipRatio[target];
+                        totalWeight += w;
+                    }
+                }
+            }
+        }
+        servoRealizedScale[axis] = (totalWeight > 1e-3f) ? (weightedSum / totalWeight) : 1.0f;
+    }
+}
 
 void writeServos(void)
 {
-    servoTable();
+    int16_t preClamp[MAX_SUPPORTED_SERVOS];
+    int16_t mid[MAX_SUPPORTED_SERVOS];
+    servoTable(preClamp, mid);
     filterServos();
+    updateServoRealizedAxisScales(preClamp, mid);
 
     uint8_t servoIndex = 0;
     switch (getMixerMode()) {
@@ -461,7 +508,7 @@ void servoMixer(void)
     input[INPUT_GIMBAL_PITCH] = scaleRange(attitude.values.pitch, -1800, 1800, -500, +500);
     input[INPUT_GIMBAL_ROLL] = scaleRange(attitude.values.roll, -1800, 1800, -500, +500);
 
-    input[INPUT_STABILIZED_THROTTLE] = motor[0] - 1000 - 500;  // Since it derives from rcCommand or mincommand and must be [-500:+500]
+    input[INPUT_STABILIZED_THROTTLE] = lrintf(motorConvertToExternal(motor[0])) - PWM_RANGE_MIDDLE;
 
     // center the RC input value around the RC middle value
     // by subtracting the RC middle value from the RC input value, we get:
@@ -513,7 +560,7 @@ void servoMixer(void)
     }
 }
 
-static void servoTable(void)
+static void servoTable(int16_t *preClampOut, int16_t *midOut)
 {
     // airplane / servo mixes
     switch (getMixerMode()) {
@@ -562,8 +609,10 @@ static void servoTable(void)
         }
     }
 
-    // constrain servos
+    // capture unconstrained servo travel and constrain servos
     for (int i = 0; i < MAX_SUPPORTED_SERVOS; i++) {
+        preClampOut[i] = servo[i];
+        midOut[i] = mixerIsTricopter() ? servoParams(i)->middle : determineServoMiddleOrForwardFromChannel(i);
         servo[i] = constrain(servo[i], servoParams(i)->min, servoParams(i)->max); // limit the values
     }
 }
@@ -571,6 +620,36 @@ static void servoTable(void)
 bool isMixerUsingServos(void)
 {
     return useServo;
+}
+
+bool servoHasStabilizedAxis(int axis)
+{
+    if (axis < 0 || axis >= XYZ_AXIS_COUNT) {
+        return false;
+    }
+    if (mixerIsTricopter()) {
+        return axis == FD_YAW;
+    }
+    if (!useServo) {
+        return false;
+    }
+    const uint8_t source = (uint8_t)(INPUT_STABILIZED_ROLL + axis);
+    for (int i = 0; i < servoRuleCount; i++) {
+        if ((currentServoMixer[i].box == 0 || IS_RC_MODE_ACTIVE(BOXSERVO1 + currentServoMixer[i].box - 1))
+            && currentServoMixer[i].inputSource == source
+            && currentServoMixer[i].rate != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+float servoGetRealizedAxisNorm(int axis, float fallbackNorm)
+{
+    if (axis < 0 || axis >= XYZ_AXIS_COUNT || !servoHasStabilizedAxis(axis)) {
+        return 0.0f;
+    }
+    return fallbackNorm * servoRealizedScale[axis];
 }
 
 static svfLowpassFilter_t servoFilter[MAX_SUPPORTED_SERVOS];

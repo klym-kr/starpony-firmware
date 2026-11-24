@@ -50,6 +50,7 @@
 
 #include "flight/failsafe.h"
 #include "flight/imu.h"
+#include "flight/ladrc.h"
 #include "flight/mixer.h"
 #include "flight/pid.h"
 #include "flight/pid_init.h"
@@ -93,6 +94,7 @@
 #include "sensors/battery.h"
 #include "sensors/compass.h"
 #include "sensors/gyro.h"
+#include "sensors/gyro_init.h"
 
 #include "config.h"
 
@@ -833,6 +835,26 @@ void changePidProfileFromCellCount(uint8_t cellCount)
     }
 }
 
+void indiRefreshRuntimeRatesAndFilters(void)
+{
+#ifdef USE_LADRC
+    ladrcSetFixedWing(isFixedWing());
+#endif
+    validateAndFixGyroConfig();
+    gyroSetTargetLooptime(pidConfig()->pid_process_denom);
+#if defined(USE_DSHOT_TELEMETRY) || defined(USE_ESC_SENSOR)
+    initDshotTelemetry(gyro.targetLooptime);
+#endif
+    gyroInitFilters();
+    pidInit(currentPidProfile);
+    mixerInitProfile();
+#ifdef USE_SERVOS
+    servosFilterInit();
+#endif
+    rescheduleTask(TASK_FILTER, gyro.targetLooptime);
+    rescheduleTask(TASK_PID, gyro.targetLooptime);
+}
+
 void changePidProfile(uint8_t pidProfileIndex)
 {
     // The config switch will cause a big enough delay in the current task to upset the scheduler
@@ -842,9 +864,8 @@ void changePidProfile(uint8_t pidProfileIndex)
         systemConfigMutable()->pidProfileIndex = pidProfileIndex;
         loadPidProfile();
 
-        pidInit(currentPidProfile);
+        indiRefreshRuntimeRatesAndFilters();
         initEscEndpoints();
-        mixerInitProfile();
     }
 
     beeperConfirmationBeeps(pidProfileIndex + 1);

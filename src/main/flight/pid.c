@@ -537,6 +537,11 @@ float pidCompensateThrustLinearization(float throttle)
     }
     return throttle;
 }
+
+float pidGetThrustLinearization(void)
+{
+    return pidRuntime.thrustLinearization;
+}
 #endif
 
 #if defined(USE_ACC)
@@ -634,7 +639,13 @@ STATIC_UNIT_TESTED FAST_CODE_NOINLINE float pidLevel(int axis, const pidProfile_
 
     const float currentAngle = (attitude.raw[axis] - angleTrim->raw[axis]) / 10.0f; // stepped at 500hz with some 4ms flat spots
     const float errorAngle = angleTarget - currentAngle;
-    float angleRate = errorAngle * pidRuntime.angleGain + angleFeedforward;
+    float angleGain = pidRuntime.angleGain;
+#ifdef USE_LADRC
+    if (!ladrcProfiles(systemConfig()->pidProfileIndex)->manual_override) {
+        angleGain = indiGetAngleGain();
+    }
+#endif
+    float angleRate = errorAngle * angleGain + angleFeedforward;
 
     // minimise cross-axis wobble due to faster yaw responses than roll or pitch, and make co-ordinated yaw turns
     // by compensating for the effect of yaw on roll while pitched, and on pitch while rolled
@@ -659,7 +670,7 @@ STATIC_UNIT_TESTED FAST_CODE_NOINLINE float pidLevel(int axis, const pidProfile_
     //logging
     if (axis == FD_ROLL) {
         DEBUG_SET(DEBUG_ANGLE_MODE, 0, lrintf(angleTarget * 10.0f)); // target angle
-        DEBUG_SET(DEBUG_ANGLE_MODE, 1, lrintf(errorAngle * pidRuntime.angleGain * 10.0f)); // un-smoothed error correction in degrees
+        DEBUG_SET(DEBUG_ANGLE_MODE, 1, lrintf(errorAngle * angleGain * 10.0f)); // un-smoothed error correction in degrees
         DEBUG_SET(DEBUG_ANGLE_MODE, 2, lrintf(angleFeedforward * 10.0f)); // feedforward amount in degrees
         DEBUG_SET(DEBUG_ANGLE_MODE, 3, lrintf(currentAngle * 10.0f)); // angle returned
 
@@ -690,7 +701,13 @@ static FAST_CODE_NOINLINE void handleCrashRecovery(
             if (sensors(SENSOR_ACC)) {
                 // errorAngle is deviation from horizontal
                 const float errorAngle =  -(attitude.raw[axis] - angleTrim->raw[axis]) / 10.0f;
-                *currentPidSetpoint = errorAngle * pidRuntime.angleGain;
+                float angleGain = pidRuntime.angleGain;
+#ifdef USE_LADRC
+                if (!ladrcProfiles(systemConfig()->pidProfileIndex)->manual_override) {
+                    angleGain = indiGetAngleGain();
+                }
+#endif
+                *currentPidSetpoint = errorAngle * angleGain;
                 *errorRate = *currentPidSetpoint - gyroRate;
             }
         }
@@ -772,12 +789,11 @@ int acroTrainerSign(float x)
 // Use the FAST_CODE_NOINLINE directive to avoid this code from being inlined into ITCM RAM. We accept the
 // performance decrease when Acro Trainer mode is active under the assumption that user is unlikely to be
 // expecting ultimate flight performance at very high loop rates when in this mode.
-static FAST_CODE_NOINLINE float applyAcroTrainer(int axis, const rollAndPitchTrims_t *angleTrim, float setPoint, bool *resetDisturbance)
+static FAST_CODE_NOINLINE float applyAcroTrainer(int axis, const rollAndPitchTrims_t *angleTrim, float setPoint)
 {
     float ret = setPoint;
 
     if (!FLIGHT_MODE(ANGLE_MODE  | HORIZON_MODE | GPS_RESCUE_MODE | ALT_HOLD_MODE | POS_HOLD_MODE)) {
-        bool resetIterm = false;
         float projectedAngle = 0;
         const int setpointSign = acroTrainerSign(setPoint);
         const float currentAngle = (attitude.raw[axis] - angleTrim->raw[axis]) / 10.0f;
@@ -791,7 +807,6 @@ static FAST_CODE_NOINLINE float applyAcroTrainer(int axis, const rollAndPitchTri
         if ((fabsf(currentAngle) > pidRuntime.acroTrainerAngleLimit) && (pidRuntime.acroTrainerAxisState[axis] == 0)) {
             if (angleSign == setpointSign) {
                 pidRuntime.acroTrainerAxisState[axis] = angleSign;
-                resetIterm = true;
             }
         }
 
@@ -808,12 +823,7 @@ static FAST_CODE_NOINLINE float applyAcroTrainer(int axis, const rollAndPitchTri
             const int projectedAngleSign = acroTrainerSign(projectedAngle);
             if ((fabsf(projectedAngle) > pidRuntime.acroTrainerAngleLimit) && (projectedAngleSign == setpointSign)) {
                 ret = ((pidRuntime.acroTrainerAngleLimit * projectedAngleSign) - projectedAngle) * pidRuntime.acroTrainerGain;
-                resetIterm = true;
             }
-        }
-
-        if (resetIterm && resetDisturbance) {
-            *resetDisturbance = true;
         }
 
         if (axis == pidRuntime.acroTrainerDebugAxis) {
@@ -1055,6 +1065,24 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
                     DEBUG_SET(DEBUG_ANGLE_TARGET, 2, currentPidSetpoint);
                 }
             }
+#ifdef USE_WING
+            if (isFixedWing() && levelMode != LEVEL_MODE_OFF && sensors(SENSOR_ACC)) {
+                float airspeedMs = pidGetWingAirspeedCms() * 0.01f;
+                if (airspeedMs < 5.0f) {
+#ifdef USE_LADRC
+                    airspeedMs = ladrcProfiles(systemConfig()->pidProfileIndex)->airspeed_ref_cms * 0.01f;
+#else
+                    airspeedMs = 15.0f;
+#endif
+                }
+                airspeedMs = constrainf(airspeedMs, 8.0f, 60.0f);
+                const float phiRad = DECIDEGREES_TO_RADIANS(attitude.values.roll);
+                const float thetaRad = DECIDEGREES_TO_RADIANS(attitude.values.pitch);
+                const float rCoord = RADIANS_TO_DEGREES((G_ACCELERATION / airspeedMs) * sin_approx(phiRad) * cos_approx(thetaRad));
+                const float yawStickAtten = 1.0f - constrainf(fabsf(getRcDeflection(FD_YAW)) * 2.0f, 0.0f, 1.0f);
+                currentPidSetpoint += rCoord * yawStickAtten;
+            }
+#endif
         }
 #endif
 
@@ -1064,7 +1092,7 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
 
 #ifdef USE_ACRO_TRAINER
         if ((axis != FD_YAW) && pidRuntime.acroTrainerActive && !pidRuntime.inCrashRecoveryMode && !launchControlActive && !companionControlsFlight) {
-            currentPidSetpoint = applyAcroTrainer(axis, angleTrim, currentPidSetpoint, &resetDisturbance);
+            currentPidSetpoint = applyAcroTrainer(axis, angleTrim, currentPidSetpoint);
         }
 #endif // USE_ACRO_TRAINER
 
@@ -1198,6 +1226,11 @@ void pidSetAcroTrainerState(bool newState)
         }
         pidRuntime.acroTrainerActive = newState;
     }
+}
+
+bool pidIsAcroTrainerActive(void)
+{
+    return pidRuntime.acroTrainerActive;
 }
 #endif // USE_ACRO_TRAINER
 

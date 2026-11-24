@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifndef sq
@@ -180,8 +181,30 @@ static inline int constrain(int amt, int low, int high)
         return amt;
 }
 
+static inline bool floatIsFiniteBits(float x)
+{
+    uint32_t bits;
+    __builtin_memcpy(&bits, &x, sizeof(bits));
+    return (bits & 0x7F800000U) != 0x7F800000U;
+}
+
+static inline bool floatIsNaNBits(float x)
+{
+    uint32_t bits;
+    __builtin_memcpy(&bits, &x, sizeof(bits));
+    return ((bits & 0x7F800000U) == 0x7F800000U) && ((bits & 0x007FFFFFU) != 0U);
+}
+
 static inline float constrainf(float amt, float low, float high)
 {
+    uint32_t bits;
+    __builtin_memcpy(&bits, &amt, sizeof(bits));
+    if ((bits & 0x7F800000U) == 0x7F800000U) {
+        if ((bits & 0x007FFFFFU) != 0U) {
+            return (low <= 0.0f && high >= 0.0f) ? 0.0f : low;
+        }
+        return (bits & 0x80000000U) ? low : high;
+    }
     if (amt < low)
         return low;
     else if (amt > high)

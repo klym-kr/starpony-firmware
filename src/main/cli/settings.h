@@ -202,11 +202,16 @@ typedef enum {
     MODE_ARRAY = (2 << VALUE_MODE_OFFSET),
     MODE_BITSET = (3 << VALUE_MODE_OFFSET),
     MODE_STRING = (4 << VALUE_MODE_OFFSET),
+
+    // optional decimal display/input scaling, bits 9-10
+    VALUE_SCALE_10 = (1 << 9),
+    VALUE_SCALE_100 = (2 << 9),
 } cliValueFlag_e;
 
 #define VALUE_TYPE_MASK (0x07)
 #define VALUE_SECTION_MASK (0x38)
 #define VALUE_MODE_MASK (0x1C0)
+#define VALUE_SCALE_MASK (0x600)
 
 typedef struct cliMinMaxConfig_s {
     const int16_t min;

@@ -2880,12 +2880,17 @@ RAM_CODE static mspResult_e mspFcProcessOutCommandWithArg(mspDescriptor_t srcDes
             sbufWriteU16(dst, profile->axis[axis].b0_deci);
             sbufWriteU16(dst, profile->axis[axis].td_hz);
         }
+        sbufWriteU16(dst, profile->prop_size_deci_in);
+        sbufWriteU16(dst, profile->auw_centi_kg);
+        sbufWriteU16(dst, profile->agility_pct);
+        sbufWriteU16(dst, profile->authority_trim_pct);
+        sbufWriteU8(dst, profile->manual_override ? 1 : 0);
         break;
     }
 
     case MSP2_ST4R_GET_LADRC_STATE: {
         const uint8_t profileIndex = getCurrentPidProfileIndex();
-        sbufWriteU8(dst, 1); // LADRC is sole active controller
+        sbufWriteU8(dst, 1); // LADRC/INDI is sole active controller
         sbufWriteU8(dst, profileIndex);
         sbufWriteU16(dst, (uint16_t)targetPidLooptime);
         sbufWriteU16(dst, (uint16_t)lrintf(ladrcGetExternalB0Scale() * 1000.0f));
@@ -2895,9 +2900,14 @@ RAM_CODE static mspResult_e mspFcProcessOutCommandWithArg(mspDescriptor_t srcDes
             sbufWriteF32(dst, st ? (st->z1 * LADRC_RATE_SCALE_FROM_NORM) : 0.0f);
             sbufWriteF32(dst, st ? st->z2 : 0.0f);
             sbufWriteF32(dst, st ? st->distTermSum : 0.0f);
-            sbufWriteF32(dst, st ? (st->pTermSum + st->dTermSum) : 0.0f);
+            sbufWriteF32(dst, st ? (st->deltaUNorm * PID_MIXER_SCALING) : 0.0f);
             sbufWriteF32(dst, st ? (st->uCmdNorm * PID_MIXER_SCALING) : 0.0f);
         }
+        const ladrcProfile_t *ladrcProfile = ladrcProfiles(profileIndex);
+        sbufWriteU8(dst, (uint8_t)indiGetFeedbackMode());
+        sbufWriteU8(dst, indiGetDshotActiveMotorCount());
+        sbufWriteU16(dst, (uint16_t)lrintf(indiComputeFIndiHz(ladrcProfile) * 10.0f));
+        sbufWriteU16(dst, (uint16_t)lrintf(indiComputeRpmMinHz(ladrcProfile) * 10.0f));
         break;
     }
 
@@ -3507,6 +3517,9 @@ RAM_CODE static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t
         break;
     }
     case MSP_SET_FILTER_CONFIG:
+        if (ARMING_FLAG(ARMED)) {
+            return MSP_RESULT_ERROR;
+        }
         gyroConfigMutable()->gyro_lpf1_static_hz = sbufReadU8(src);
         currentPidProfile->dterm_lpf1_static_hz = sbufReadU16(src);
         currentPidProfile->yaw_lowpass_hz = sbufReadU16(src);
@@ -4747,6 +4760,27 @@ RAM_CODE static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t
             }
         }
 
+        bool hasPhysicalParams = false;
+        uint16_t propSizeDeciIn = 50;
+        uint16_t auwCentiKg = 65;
+        uint16_t agilityPct = 100;
+        uint16_t authorityTrimPct = 100;
+        uint8_t manualOverride = 0;
+        if (sbufBytesRemaining(src) >= 9) {
+            propSizeDeciIn = sbufReadU16(src);
+            auwCentiKg = sbufReadU16(src);
+            agilityPct = sbufReadU16(src);
+            authorityTrimPct = sbufReadU16(src);
+            manualOverride = sbufReadU8(src) ? 1 : 0;
+            if (propSizeDeciIn < 30 || propSizeDeciIn > 300
+                || auwCentiKg < 20 || auwCentiKg > 5000
+                || agilityPct < 50 || agilityPct > 150
+                || authorityTrimPct < 50 || authorityTrimPct > 150) {
+                return MSP_RESULT_ERROR;
+            }
+            hasPhysicalParams = true;
+        }
+
         ladrcProfile_t *profile = ladrcProfilesMutable(profileIndex);
         profile->anti_windup = antiWindup;
         profile->vbat_b0_comp = vbatB0Comp;
@@ -4756,9 +4790,23 @@ RAM_CODE static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t
         for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
             profile->axis[axis] = parsedAxes[axis];
         }
+        if (hasPhysicalParams) {
+            profile->prop_size_deci_in = propSizeDeciIn;
+            profile->auw_centi_kg = auwCentiKg;
+            profile->agility_pct = agilityPct;
+            profile->authority_trim_pct = authorityTrimPct;
+            profile->manual_override = manualOverride;
+        }
+        if (profile->manual_override == 0) {
+            indiApplyPhysicalParams(profile);
+        }
 
         if (profileIndex == getCurrentPidProfileIndex()) {
-            ladrcInit(profileIndex, pidGetDT());
+            if (!ARMING_FLAG(ARMED)) {
+                indiRefreshRuntimeRatesAndFilters();
+            } else {
+                ladrcReconfigureLive(profileIndex, pidGetDT());
+            }
         }
         break;
     }

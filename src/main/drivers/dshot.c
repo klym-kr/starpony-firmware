@@ -158,6 +158,9 @@ FAST_DATA_ZERO_INIT static float minMotorFrequencyHz;
 FAST_DATA_ZERO_INIT static float erpmToHz;
 FAST_DATA_ZERO_INIT static float dshotRpmAverage;
 FAST_DATA_ZERO_INIT static float dshotRpm[MAX_SUPPORTED_MOTORS];
+FAST_DATA_ZERO_INIT static timeUs_t lastValidErpmUs[MAX_SUPPORTED_MOTORS];
+FAST_DATA_ZERO_INIT static bool hasValidErpm[MAX_SUPPORTED_MOTORS];
+FAST_DATA_ZERO_INIT static timeUs_t lastTelemetryUpdateUs;
 FAST_DATA_ZERO_INIT static bool edtAlwaysDecode;
 
 // Lookup table for extended telemetry type decoding
@@ -223,6 +226,11 @@ static uint32_t dshot_decode_eRPM_telemetry_value(uint16_t value)
 static void dshot_decode_telemetry_value(uint8_t motorIndex, uint32_t *pDecoded, dshotTelemetryType_t *pType)
 {
     uint16_t value = dshotTelemetryState.motorState[motorIndex].rawValue;
+    if (value == DSHOT_TELEMETRY_INVALID || value == DSHOT_TELEMETRY_NOEDGE) {
+        *pDecoded = DSHOT_TELEMETRY_INVALID;
+        *pType = DSHOT_TELEMETRY_TYPE_eRPM;
+        return;
+    }
     bool isEdtEnabled = edtAlwaysDecode || (dshotTelemetryState.motorState[motorIndex].telemetryTypes & DSHOT_EXTENDED_TELEMETRY_MASK) != 0;
 
     // https://github.com/bird-sanctuary/extended-dshot-telemetry
@@ -261,11 +269,12 @@ static void dshotUpdateTelemetryData(uint8_t motorIndex, dshotTelemetryType_t ty
     }
 }
 
-FAST_CODE_NOINLINE void updateDshotTelemetry(void)
+FAST_CODE_NOINLINE void updateDshotTelemetry(timeUs_t currentTimeUs)
 {
     if (!useDshotTelemetry) {
         return;
     }
+    lastTelemetryUpdateUs = currentTimeUs;
 
     // Only process telemetry in case it hasn´t been processed yet
     if (dshotTelemetryState.rawValueState != DSHOT_RAW_VALUE_STATE_NOT_PROCESSED) {
@@ -282,12 +291,15 @@ FAST_CODE_NOINLINE void updateDshotTelemetry(void)
         uint32_t value;
 
         dshot_decode_telemetry_value(k, &value, &type);
+        dshotTelemetryState.motorState[k].rawValue = DSHOT_TELEMETRY_INVALID;
 
         if (value != DSHOT_TELEMETRY_INVALID) {
             dshotUpdateTelemetryData(k, type, value);
 
             if (type == DSHOT_TELEMETRY_TYPE_eRPM) {
                 dshotRpm[k] = erpmToRpm(value);
+                lastValidErpmUs[k] = currentTimeUs;
+                hasValidErpm[k] = true;
                 erpmTotal += value;
                 rpmSamples++;
             }
@@ -340,6 +352,14 @@ bool isDshotMotorTelemetryActive(uint8_t motorIndex)
     return (dshotTelemetryState.motorState[motorIndex].telemetryTypes & (1 << DSHOT_TELEMETRY_TYPE_eRPM)) != 0;
 }
 
+bool isDshotMotorTelemetryFresh(uint8_t motorIndex, timeUs_t currentTimeUs)
+{
+    if (motorIndex >= MAX_SUPPORTED_MOTORS) {
+        return false;
+    }
+    return hasValidErpm[motorIndex] && (cmpTimeUs(currentTimeUs, lastValidErpmUs[motorIndex]) <= 25000);
+}
+
 bool isDshotTelemetryActive(void)
 {
     const unsigned motorCount = dshotMotorCount;
@@ -357,6 +377,12 @@ bool isDshotTelemetryActive(void)
 void dshotCleanTelemetryData(void)
 {
     memset(&dshotTelemetryState, 0, sizeof(dshotTelemetryState));
+    memset(lastValidErpmUs, 0, sizeof(lastValidErpmUs));
+    memset(hasValidErpm, 0, sizeof(hasValidErpm));
+    lastTelemetryUpdateUs = 0;
+    for (unsigned i = 0; i < MAX_SUPPORTED_MOTORS; i++) {
+        dshotTelemetryState.motorState[i].rawValue = DSHOT_TELEMETRY_INVALID;
+    }
 }
 
 bool getDshotSensorData(escSensorData_t *dest, int motorIndex) {
@@ -402,7 +428,10 @@ int16_t getDshotTelemetryMotorInvalidPercent(uint8_t motorIndex)
 {
     int16_t invalidPercent = 0;
 
-    if (isDshotMotorTelemetryActive(motorIndex)) {
+    if (motorIndex < MAX_SUPPORTED_MOTORS
+        && isDshotMotorTelemetryActive(motorIndex)
+        && hasValidErpm[motorIndex]
+        && (lastTelemetryUpdateUs == 0 || cmpTimeUs(lastTelemetryUpdateUs, lastValidErpmUs[motorIndex]) <= 250000)) {
         const uint32_t totalCount = dshotTelemetryQuality[motorIndex].packetCountSum;
         const uint32_t invalidCount = dshotTelemetryQuality[motorIndex].invalidCountSum;
         if (totalCount > 0) {

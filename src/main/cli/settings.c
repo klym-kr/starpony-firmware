@@ -2151,6 +2151,12 @@ const clivalue_t valueTable[] = {
 
     { "ladrc_sat_z3_inhibit",      VAR_UINT8  | PROFILE_VALUE | MODE_LOOKUP, .config.lookup = { TABLE_OFF_ON }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, sat_z3_inhibit) },
     { "ladrc_ground_wc_pct",       VAR_UINT8  | PROFILE_VALUE, .config.minmaxUnsigned = { 0, 100 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, ground_wc_pct) },
+
+    { "prop_size_inches",          VAR_UINT16 | PROFILE_VALUE | VALUE_SCALE_10,  .config.minmaxUnsigned = { 30, 300 },  PG_LADRC_PROFILE, offsetof(ladrcProfile_t, prop_size_deci_in) },
+    { "all_up_weight_kg",          VAR_UINT16 | PROFILE_VALUE | VALUE_SCALE_100, .config.minmaxUnsigned = { 20, 5000 }, PG_LADRC_PROFILE, offsetof(ladrcProfile_t, auw_centi_kg) },
+    { "agility",                   VAR_UINT16 | PROFILE_VALUE | VALUE_SCALE_100, .config.minmaxUnsigned = { 50, 150 },  PG_LADRC_PROFILE, offsetof(ladrcProfile_t, agility_pct) },
+    { "authority_trim",            VAR_UINT16 | PROFILE_VALUE | VALUE_SCALE_100, .config.minmaxUnsigned = { 50, 150 },  PG_LADRC_PROFILE, offsetof(ladrcProfile_t, authority_trim_pct) },
+    { "indi_manual_override",      VAR_UINT8  | PROFILE_VALUE | MODE_LOOKUP,     .config.lookup = { TABLE_OFF_ON },    PG_LADRC_PROFILE, offsetof(ladrcProfile_t, manual_override) },
 #endif
 
 #ifdef USE_COMPANION_LINK

@@ -294,6 +294,7 @@ FAST_CODE_NOINLINE bool pwmTelemetryDecode(void)
 #endif
 
             uint16_t rawValue;
+            dshotTelemetryState.motorState[i].rawValue = DSHOT_TELEMETRY_INVALID;
 
             if (edges > MIN_GCR_EDGES) {
                 dshotTelemetryState.readCount++;

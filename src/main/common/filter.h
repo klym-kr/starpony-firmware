@@ -141,6 +141,7 @@ float filterGetNotchQ(float centerFreq, float cutoffFreq);
 void svfLowpassFilterInit(svfLowpassFilter_t *filter, float filterFreq, float dt);
 void svfLowpassFilterUpdate(svfLowpassFilter_t *filter, float filterFreq, float dt);
 float svfLowpassFilterApply(svfLowpassFilter_t *filter, float input);
+float svfLowpassFilterApplyWithBandpass(svfLowpassFilter_t *filter, float input, float *bpOut);
 
 void svfNotchInit(svfNotchFilter_t *filter, float filterFreq, float dt, float Q);
 void svfNotchUpdate(svfNotchFilter_t *filter, float filterFreq, float dt, float Q);

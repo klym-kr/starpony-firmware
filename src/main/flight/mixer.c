@@ -19,6 +19,7 @@
  */
 
 #include <stdlib.h>
+#include <stddef.h>
 #include <math.h>
 #include <float.h>
 
@@ -55,6 +56,9 @@
 #include "flight/mixer_tricopter.h"
 #include "flight/pid.h"
 #include "flight/rpm_filter.h"
+#ifdef USE_SERVOS
+#include "flight/servos.h"
+#endif
 
 #include "io/gps.h"
 #ifdef USE_COMPANION_LINK
@@ -83,6 +87,16 @@ static FAST_DATA float lastMotorMixAuthorityScale = 1.0f;
 float FAST_CODE_NOINLINE mixerGetAuthorityScale(void)
 {
     return lastMotorMixAuthorityScale;
+}
+
+void FAST_CODE mixerProjectMotorOutputsToAxes(const float *motorOutputs, const motorMixer_t *mixer, uint8_t motorCount, float axesOut[XYZ_AXIS_COUNT])
+{
+    STATIC_ASSERT(sizeof(motorMixer_t) == 4 * sizeof(float), motorMixer_size_mismatch);
+    STATIC_ASSERT(offsetof(motorMixer_t, throttle) == 0, motorMixer_throttle_offset);
+    STATIC_ASSERT(offsetof(motorMixer_t, roll) == sizeof(float), motorMixer_roll_offset);
+    STATIC_ASSERT(offsetof(motorMixer_t, pitch) == 2 * sizeof(float), motorMixer_pitch_offset);
+    STATIC_ASSERT(offsetof(motorMixer_t, yaw) == 3 * sizeof(float), motorMixer_yaw_offset);
+    indiProjectMotorOutputsToAxes(motorOutputs, (const float (*)[4])mixer, motorCount, axesOut);
 }
 
 float FAST_DATA_ZERO_INIT motor[MAX_SUPPORTED_MOTORS];
@@ -703,6 +717,12 @@ FAST_CODE_NOINLINE void mixTable(timeUs_t currentTimeUs)
 
     if (applyCrashFlipModeToMotors()) {
         lastMotorMixAuthorityScale = 0.0f;
+#ifdef USE_LADRC
+        ladrcSetDshotFeedbackStatus(false, 0);
+        for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
+            ladrcSetAxisActuatorFeedback(axis, 0.0f, 0.0f, false);
+        }
+#endif
         return;
         // if crash flip modeis being applied to the motors, mixing is done
 
@@ -783,24 +803,6 @@ FAST_CODE_NOINLINE void mixTable(timeUs_t currentTimeUs)
     }
 #endif
 
-    // Find roll/pitch/yaw desired output
-    // ??? Where is the optimal location for this code?
-    float motorMix[MAX_SUPPORTED_MOTORS];
-    float motorMixMax = 0, motorMixMin = 0;
-    for (int i = 0; i < mixerRuntime.motorCount; i++) {
-        float mix =
-            scaledAxisPidRoll  * activeMixer[i].roll +
-            scaledAxisPidPitch * activeMixer[i].pitch +
-            scaledAxisPidYaw   * activeMixer[i].yaw;
-
-        if (mix > motorMixMax) {
-            motorMixMax = mix;
-        } else if (mix < motorMixMin) {
-            motorMixMin = mix;
-        }
-        motorMix[i] = mix;
-    }
-
     //  The following fixed throttle values will not be shown in the blackbox log
 #ifdef USE_YAW_SPIN_RECOVERY
     // 50% throttle provides the maximum authority for yaw recovery when airmode is not active.
@@ -845,15 +847,34 @@ FAST_CODE_NOINLINE void mixTable(timeUs_t currentTimeUs)
     }
 #endif
 
+    // Allocate motor mix with strict priority Roll > Pitch > Yaw inside [0, 1] motor span
+    float motorMix[MAX_SUPPORTED_MOTORS];
+    float motorMixMax = 0.0f, motorMixMin = 0.0f, rawMotorMixRange = 0.0f;
+    const bool useThrottleAwareLegacy = (mixerConfig()->mixer_type == MIXER_LEGACY && !isFixedWing());
+    if (useThrottleAwareLegacy) {
+        indiAllocatePriorityMixWithThrottle((const float (*)[4])activeMixer, mixerRuntime.motorCount,
+                                            throttle, motorOutputMixSign, airmodeEnabled,
+                                            scaledAxisPidRoll, scaledAxisPidPitch, scaledAxisPidYaw,
+                                            motorMix, &throttle, &motorMixMin, &motorMixMax, &rawMotorMixRange);
+    } else {
+        indiAllocatePriorityMix((const float (*)[4])activeMixer, mixerRuntime.motorCount,
+                                scaledAxisPidRoll, scaledAxisPidPitch, scaledAxisPidYaw,
+                                motorMix, &motorMixMin, &motorMixMax, &rawMotorMixRange);
+    }
+
     motorMixRange = motorMixMax - motorMixMin;
     // ADRC-033: Publish saturation flag if any motor demand exceeded saturation limits
-    ladrcSetMixerSaturated(motorMixRange > 1.0f);
+    ladrcSetMixerSaturated(rawMotorMixRange > 1.0f || motorMixRange < rawMotorMixRange - 1e-4f);
 
     // note that here airmodeEnabled is true also when Launch Control is active
     float mixAuthorityScale = 1.0f;
     switch (mixerConfig()->mixer_type) {
     case MIXER_LEGACY:
-        mixAuthorityScale = applyMixerAdjustment(motorMix, motorMixMin, motorMixMax, airmodeEnabled);
+        if (useThrottleAwareLegacy) {
+            mixAuthorityScale = (rawMotorMixRange > 1e-6f) ? constrainf(motorMixRange / rawMotorMixRange, 0.0f, 1.0f) : 1.0f;
+        } else {
+            mixAuthorityScale = applyMixerAdjustment(motorMix, motorMixMin, motorMixMax, airmodeEnabled);
+        }
         break;
     case MIXER_LINEAR:
     case MIXER_DYNAMIC:
@@ -867,12 +888,16 @@ FAST_CODE_NOINLINE void mixTable(timeUs_t currentTimeUs)
         break;
     }
 
+    // Preserve pre-clipping demand range for Blackbox / crash recovery diagnostics
+    motorMixRange = fmaxf(motorMixRange, rawMotorMixRange);
+
     if (isFixedWing()) {
         // Fixed-wing roll/pitch/yaw comes from aerodynamic servos (servos.c reads pidData[axis].Sum directly),
         // not multirotor motor differential mixing, so low-throttle airmodeTransitionPercent must not attenuate LADRC authority.
         mixAuthorityScale = FLIGHT_MODE(PASSTHRU_MODE) ? 0.0f : 1.0f;
     }
 
+    bool motorsStopped = false;
     if (featureIsEnabled(FEATURE_MOTOR_STOP)
         && ARMING_FLAG(ARMED)
         && !mixerRuntime.feature3dEnabled
@@ -883,11 +908,136 @@ FAST_CODE_NOINLINE void mixTable(timeUs_t currentTimeUs)
         // Fixed-wing aerodynamic servos retain control authority while motor is stopped on glide
         lastMotorMixAuthorityScale = isFixedWing() ? mixAuthorityScale : 0.0f;
         applyMotorStop();
+        motorsStopped = true;
     } else {
         lastMotorMixAuthorityScale = (!ARMING_FLAG(ARMED)) ? 0.0f : mixAuthorityScale;
         // Apply the mix to motor endpoints
         applyMixToMotors(motorMix, activeMixer);
     }
+
+#ifdef USE_LADRC
+    float colNormSq[XYZ_AXIS_COUNT] = { 0.0f, 0.0f, 0.0f };
+    for (int i = 0; i < mixerRuntime.motorCount; i++) {
+        colNormSq[FD_ROLL] += activeMixer[i].roll * activeMixer[i].roll;
+        colNormSq[FD_PITCH] += activeMixer[i].pitch * activeMixer[i].pitch;
+        colNormSq[FD_YAW] += activeMixer[i].yaw * activeMixer[i].yaw;
+    }
+
+    float uActualMotor[XYZ_AXIS_COUNT] = { 0.0f, 0.0f, 0.0f };
+    if (ARMING_FLAG(ARMED) && !isFixedWing() && !motorsStopped && mixerRuntime.motorCount > 0) {
+        float effectiveMix[MAX_SUPPORTED_MOTORS];
+        for (int i = 0; i < mixerRuntime.motorCount; i++) {
+            const float mOut = constrainf(motorOutputMixSign * motorMix[i] + throttle * activeMixer[i].throttle, 0.0f, 1.0f);
+            effectiveMix[i] = motorOutputMixSign * (mOut - throttle * activeMixer[i].throttle);
+        }
+        mixerProjectMotorOutputsToAxes(effectiveMix, activeMixer, mixerRuntime.motorCount, uActualMotor);
+        if (!mixerConfig()->yaw_motors_reversed) {
+            uActualMotor[FD_YAW] = -uActualMotor[FD_YAW];
+        }
+    }
+
+    float uRpm[XYZ_AXIS_COUNT] = { 0.0f, 0.0f, 0.0f };
+    bool dshotRpmValid = false;
+    uint8_t dshotActiveMotors = 0;
+#ifdef USE_DSHOT_TELEMETRY
+    if (useDshotTelemetry && !isFixedWing() && mixerRuntime.motorCount > 0) {
+        bool allFresh = true;
+        for (int i = 0; i < mixerRuntime.motorCount; i++) {
+            if (isDshotMotorTelemetryFresh(i, currentTimeUs)) {
+                dshotActiveMotors++;
+            } else {
+                allFresh = false;
+            }
+        }
+        if (ARMING_FLAG(ARMED) && !motorsStopped && allFresh) {
+            const float dIdle = constrainf(motorConfig()->motorIdle * 0.0001f, 0.0f, 0.30f);
+            float q[MAX_SUPPORTED_MOTORS];
+            float sumM = 0.0f;
+            float sumC = 0.0f;
+            float sumD = 0.0f;
+            float sumQ = 0.0f;
+            for (int i = 0; i < mixerRuntime.motorCount; i++) {
+                const float m_i = constrainf(motorOutputMixSign * motorMix[i] + throttle * activeMixer[i].throttle, 0.0f, 1.0f);
+#ifdef USE_THRUST_LINEARIZATION
+                const float c_i = pidApplyThrustLinearization(m_i);
+#else
+                const float c_i = m_i;
+#endif
+                const float d_i = dIdle + (1.0f - dIdle) * c_i;
+                const float erpm = (float)getDshotErpm(i);
+                const float q_i = erpm * erpm;
+                q[i] = q_i;
+                sumM += m_i;
+                sumC += c_i;
+                sumD += d_i;
+                sumQ += q_i;
+            }
+            const float invCount = 1.0f / (float)mixerRuntime.motorCount;
+            const float meanM = sumM * invCount;
+            const float meanC = sumC * invCount;
+            const float meanD = sumD * invCount;
+            const float meanQ = sumQ * invCount;
+            UNUSED(meanC);
+            float sTl = 1.0f;
+#ifdef USE_THRUST_LINEARIZATION
+            const float e = pidGetThrustLinearization();
+            if (e > 0.0f) {
+                sTl = MAX(0.20f, 1.0f + e * (1.0f - 2.0f * meanM) + e * e * (1.0f - 6.0f * meanM + 6.0f * meanM * meanM));
+            }
+#endif
+            if (meanQ > 1e-2f && meanD > 0.01f && (1.0f - dIdle) > 0.1f) {
+                const float scale = meanD / (2.0f * (1.0f - dIdle) * sTl * meanQ);
+                float deltaM[MAX_SUPPORTED_MOTORS];
+                for (int i = 0; i < mixerRuntime.motorCount; i++) {
+                    deltaM[i] = motorOutputMixSign * scale * (q[i] - meanQ);
+                }
+                mixerProjectMotorOutputsToAxes(deltaM, activeMixer, mixerRuntime.motorCount, uRpm);
+                if (!mixerConfig()->yaw_motors_reversed) {
+                    uRpm[FD_YAW] = -uRpm[FD_YAW];
+                }
+                dshotRpmValid = true;
+            }
+        }
+    }
+#endif
+    ladrcSetDshotFeedbackStatus(dshotRpmValid, dshotActiveMotors);
+#ifdef USE_DSHOT_TELEMETRY
+    const bool dshotConfigured = !isFixedWing() && (mixerRuntime.motorCount > 0) && useDshotTelemetry && isMotorProtocolDshot();
+#else
+    const bool dshotConfigured = false;
+#endif
+    const bool batteryPresent = !isBatteryVoltageConfigured() || (getBatteryState() != BATTERY_NOT_PRESENT);
+    ladrcSetDshotConfiguredStatus(dshotConfigured, batteryPresent);
+
+#ifdef USE_SERVOS
+    const float rawAxisPid[XYZ_AXIS_COUNT] = {
+        scaledAxisPidRoll,
+        scaledAxisPidPitch,
+        constrainf(pidData[FD_YAW].Sum, -yawPidSumLimit, yawPidSumLimit) / PID_MIXER_SCALING,
+    };
+#endif
+    for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
+        const bool useServoAxis = isFixedWing() || (colNormSq[axis] < 1e-4f);
+        float axisActual = 0.0f;
+        float axisRpm = 0.0f;
+        bool axisDshotValid = false;
+        if (ARMING_FLAG(ARMED)) {
+            if (useServoAxis) {
+#ifdef USE_SERVOS
+                if (!FLIGHT_MODE(PASSTHRU_MODE) && servoHasStabilizedAxis(axis)) {
+                    axisActual = servoGetRealizedAxisNorm(axis, rawAxisPid[axis]);
+                }
+#endif
+                axisDshotValid = false;
+            } else {
+                axisActual = uActualMotor[axis];
+                axisRpm = uRpm[axis];
+                axisDshotValid = dshotRpmValid;
+            }
+        }
+        ladrcSetAxisActuatorFeedback(axis, axisActual, axisRpm, axisDshotValid);
+    }
+#endif
 }
 
 void mixerSetThrottleAngleCorrection(int correctionValue)

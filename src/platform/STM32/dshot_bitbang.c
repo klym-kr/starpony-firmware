@@ -570,6 +570,7 @@ static bool bbDecodeTelemetry(void)
                 bbMotors[motorIndex].bbPort->portInputCount,
                 bbMotors[motorIndex].pinIndex);
 #endif
+            dshotTelemetryState.motorState[motorIndex].rawValue = DSHOT_TELEMETRY_INVALID;
             if (rawValue == DSHOT_TELEMETRY_NOEDGE) {
                 DEBUG_SET(DEBUG_DSHOT_TELEMETRY_COUNTS, 1, debug[1] + 1);
                 continue;

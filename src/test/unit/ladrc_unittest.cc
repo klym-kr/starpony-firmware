@@ -174,10 +174,11 @@ TEST_F(LadrcTest, testOrder2ResetZeroesAccelerationZ2AndPreventsGroundWindup) {
     // Phase 1: Simulate stationary craft on ground while pre-takeoff full observer reset is active
     for (int step = 0; step < 200; step++) {
         float pOut = 0.0f, dOut = 0.0f, fOut = 0.0f, distOut = 0.0f;
-        const float sum = ladrcStepAxisEx(FD_ROLL, 200.0f, 0.0f, 500.0f, 1.0f, 1.0f, LADRC_RESET_OBSERVER_FULL,
+        const float sum = ladrcStepAxisEx(FD_ROLL, 200.0f, 0.0f, 500.0f, 1.0f, 0.0f, LADRC_RESET_OBSERVER_FULL,
                                           &pOut, &dOut, &fOut, &distOut);
         EXPECT_FLOAT_EQ(dOut, 0.0f);
         EXPECT_FLOAT_EQ(distOut, 0.0f);
+        EXPECT_FLOAT_EQ(fOut, 0.0f);
         EXPECT_FLOAT_EQ(sum, pOut);
         ladrcPostMixerUpdate(0.5f, true);
     }
@@ -188,15 +189,15 @@ TEST_F(LadrcTest, testOrder2ResetZeroesAccelerationZ2AndPreventsGroundWindup) {
     EXPECT_FLOAT_EQ(st->z3, 0.0f);
     EXPECT_FLOAT_EQ(st->distTermSum, 0.0f);
 
-    // Phase 2: Build up disturbance without reset, then trigger ground full observer reset -> Sum clears immediately
+    // Phase 2: Build up actuator feedback without reset, then trigger ground full reset -> Sum clears immediately
     for (int step = 0; step < 200; step++) {
-        ladrcStepAxisEx(FD_ROLL, 200.0f, 0.0f, 500.0f, 1.0f, 1.0f, LADRC_RESET_NONE, nullptr, nullptr, nullptr, nullptr);
+        ladrcStepAxisEx(FD_ROLL, 200.0f, 0.0f, 500.0f, 1.0f, 0.0f, LADRC_RESET_NONE, nullptr, nullptr, nullptr, nullptr);
         ladrcPostMixerUpdate(1.0f, true);
     }
-    EXPECT_GT(fabsf(st->z3), 0.1f);
+    EXPECT_GT(fabsf(st->distTermSum), 1.0f);
 
     float pOut = 0.0f, dOut = 0.0f, fOut = 0.0f, distOut = 0.0f;
-    const float resetSum = ladrcStepAxisEx(FD_ROLL, 200.0f, 0.0f, 500.0f, 1.0f, 1.0f, LADRC_RESET_OBSERVER_FULL,
+    const float resetSum = ladrcStepAxisEx(FD_ROLL, 200.0f, 0.0f, 500.0f, 1.0f, 0.0f, LADRC_RESET_OBSERVER_FULL,
                                            &pOut, &dOut, &fOut, &distOut);
     EXPECT_FLOAT_EQ(dOut, 0.0f);
     EXPECT_FLOAT_EQ(distOut, 0.0f);
@@ -207,6 +208,7 @@ TEST_F(LadrcTest, testOrder2ResetZeroesAccelerationZ2AndPreventsGroundWindup) {
 
 TEST_F(LadrcTest, testOrder2DisturbanceOnlyResetPreservesDampingZ2) {
     ladrcProfile_t *prof = ladrcProfilesMutable(0);
+    prof->manual_override = 1;
     prof->anti_windup = 1;
     prof->disturbance_limit = 500;
     prof->axis[FD_ROLL].order = LADRC_ORDER_2;
@@ -222,12 +224,12 @@ TEST_F(LadrcTest, testOrder2DisturbanceOnlyResetPreservesDampingZ2) {
 
     ladrcInit(0, 0.0005f);
 
-    // Build both z2 (accel) and z3 (disturbance) on Order-2 roll, and z2 (disturbance) on Order-1 yaw
+    // Build both gyro rate ramp and actuator feedback on Roll and Yaw
     for (int step = 0; step < 100; step++) {
         const float gyroRoll = 2.0f * (float)step;
-        ladrcStepAxisEx(FD_ROLL, 200.0f, gyroRoll, 500.0f, 1.0f, 1.0f, LADRC_RESET_NONE,
+        ladrcStepAxisEx(FD_ROLL, 200.0f, gyroRoll, 500.0f, 1.0f, 0.0f, LADRC_RESET_NONE,
                         nullptr, nullptr, nullptr, nullptr);
-        ladrcStepAxisEx(FD_YAW, 150.0f, 0.0f, 400.0f, 1.0f, 1.0f, LADRC_RESET_NONE,
+        ladrcStepAxisEx(FD_YAW, 150.0f, 0.0f, 400.0f, 1.0f, 0.0f, LADRC_RESET_NONE,
                         nullptr, nullptr, nullptr, nullptr);
         ladrcPostMixerUpdate(1.0f, true);
     }
@@ -236,12 +238,11 @@ TEST_F(LadrcTest, testOrder2DisturbanceOnlyResetPreservesDampingZ2) {
     const ladrcRuntimeAxis_t *yawSt = ladrcGetAxisState(FD_YAW);
     ASSERT_NE(rollSt, nullptr);
     ASSERT_NE(yawSt, nullptr);
-    EXPECT_GT(fabsf(rollSt->z3), 0.1f);
-    EXPECT_GT(fabsf(yawSt->z2), 0.1f);
+    EXPECT_GT(fabsf(rollSt->distTermSum), 1.0f);
+    EXPECT_GT(fabsf(yawSt->distTermSum), 1.0f);
 
     // In-flight disturbance-only reset during positive angular kick on Roll:
-    // Order-2 clears z3 (distOut == 0) while preserving active z2 D-term damping!
-    // Order-1 clears z2 (distOut == 0).
+    // Clears u_meas_filt (distOut == 0) while preserving active omegaDotMeas D-term damping!
     float rP = 0.0f, rD = 0.0f, rF = 0.0f, rDist = 0.0f;
     float yP = 0.0f, yD = 0.0f, yF = 0.0f, yDist = 0.0f;
     const float rSum = ladrcStepAxisEx(FD_ROLL, 0.0f, 500.0f, 500.0f, 1.0f, 0.0f, LADRC_RESET_DISTURBANCE,
@@ -256,29 +257,20 @@ TEST_F(LadrcTest, testOrder2DisturbanceOnlyResetPreservesDampingZ2) {
     EXPECT_LT(rD, 0.0f); // D-term opposes positive angular acceleration
 
     EXPECT_FLOAT_EQ(yDist, 0.0f);
-    EXPECT_FLOAT_EQ(yawSt->z2, 0.0f);
+    EXPECT_FLOAT_EQ(yawSt->distTermSum, 0.0f);
 
-    // Post-mixer prediction must keep z1/z2 active and predicted in disturbance-only mode
-    const float z1BeforePredict = rollSt->z1;
-    const float z2BeforePredict = rollSt->z2;
-    ladrcPostMixerUpdate(0.5f, true);
-    EXPECT_FLOAT_EQ(rollSt->z3, 0.0f);
-    EXPECT_NE(rollSt->z1, z1BeforePredict);
-    EXPECT_NE(rollSt->z2, 0.0f);
-    EXPECT_NE(rollSt->z2, z2BeforePredict);
-
-    // Explicit ladrcResetAxisDisturbance also clears only z3 on Order-2 without wiping z2
+    // Explicit ladrcResetAxisDisturbance clears feedback accumulator without wiping gyro derivative state
     ladrcStepAxisEx(FD_ROLL, 0.0f, 520.0f, 500.0f, 1.0f, 0.0f, LADRC_RESET_NONE,
                     nullptr, nullptr, nullptr, nullptr);
-    EXPECT_NE(rollSt->z3, 0.0f);
+    ladrcPostMixerUpdate(1.0f, true);
     ladrcResetAxisDisturbance(FD_ROLL);
-    EXPECT_FLOAT_EQ(rollSt->z3, 0.0f);
     EXPECT_FLOAT_EQ(rollSt->distTermSum, 0.0f);
     EXPECT_NE(rollSt->z2, 0.0f);
 }
 
 TEST_F(LadrcTest, testTrackingDifferentiatorBypassAndWeighting) {
     ladrcProfile_t *prof = ladrcProfilesMutable(0);
+    prof->manual_override = 1;
     prof->axis[FD_PITCH].order = LADRC_ORDER_2;
     prof->axis[FD_PITCH].wc_deci = 100;
     prof->axis[FD_PITCH].wo_deci = 400;
@@ -292,7 +284,7 @@ TEST_F(LadrcTest, testTrackingDifferentiatorBypassAndWeighting) {
     ladrcStepAxisEx(FD_PITCH, 300.0f, 0.0f, 500.0f, 1.0f, 0.0f, LADRC_RESET_NONE,
                     &pZero, &dZero, &fZero, &distZero);
     EXPECT_FLOAT_EQ(fZero, 0.0f);
-    EXPECT_GT(pZero, 100.0f);
+    EXPECT_GT(pZero, 0.5f);
 
     // Compare against full TD filtering from zero initial state: TD starts near zero and ramps smoothly
     ladrcInit(0, 0.0005f);
@@ -305,57 +297,37 @@ TEST_F(LadrcTest, testTrackingDifferentiatorBypassAndWeighting) {
 
 TEST_F(LadrcTest, testSaturationDisturbanceGrowthInhibit) {
     ladrcProfile_t *prof = ladrcProfilesMutable(0);
+    prof->manual_override = 1;
     prof->sat_z3_inhibit = 1;
     prof->anti_windup = 1;
-    prof->disturbance_limit = 800;
+    prof->disturbance_limit = 400;
     prof->axis[FD_ROLL].order = LADRC_ORDER_2;
     prof->axis[FD_ROLL].wc_deci = 150;
     prof->axis[FD_ROLL].wo_deci = 600;
-    prof->axis[FD_ROLL].b0_deci = 2000;
+    prof->axis[FD_ROLL].b0_deci = 200;
     prof->axis[FD_ROLL].td_hz = 0;
 
     const float dt = 0.0005f;
     ladrcInit(0, dt);
 
-    // 1. With actuator saturated (mixerSaturatedFlag = true) and commanding 500 dps while craft is held at 0 dps:
+    // With actuator saturated (authority = 0.25) and commanding 500 dps while stationary:
+    // uMeasFilt remains strictly bounded within [-disturbance_limit, +disturbance_limit] and tracks realized 0.25 scale!
     ladrcSetMixerSaturated(true);
     EXPECT_TRUE(ladrcIsMixerSaturated());
 
-    for (int step = 0; step < 100; step++) {
+    for (int step = 0; step < 400; step++) {
         ladrcStepAxis(FD_ROLL, 500.0f, 0.0f, 500.0f, 1.0f, nullptr, nullptr, nullptr, nullptr);
-        ladrcPostMixerUpdate(1.0f, true);
+        ladrcPostMixerUpdate(0.25f, true);
     }
     const ladrcRuntimeAxis_t *st = ladrcGetAxisState(FD_ROLL);
     ASSERT_NE(st, nullptr);
-    // With sat_z3_inhibit active and starting from 0, z3 must remain zero (growth completely inhibited)
-    EXPECT_FLOAT_EQ(st->z3, 0.0f);
-
-    // 2. Compare against uninhibited behavior (sat_z3_inhibit = 0):
-    ladrcInit(0, dt);
-    prof->sat_z3_inhibit = 0;
-    ladrcSetMixerSaturated(true);
-
-    for (int step = 0; step < 100; step++) {
-        ladrcStepAxis(FD_ROLL, 500.0f, 0.0f, 500.0f, 1.0f, nullptr, nullptr, nullptr, nullptr);
-        ladrcPostMixerUpdate(1.0f, true);
-    }
-    // Without inhibit, z3 winds up strongly negative (-30 or worse)
-    EXPECT_LT(st->z3, -30.0f);
-
-    // 3. Re-enable sat_z3_inhibit and verify that wound-up z3 decays towards 0 during saturation:
-    prof->sat_z3_inhibit = 1;
-    ladrcSetMixerSaturated(true);
-    // Command 0 dps while gyro is at 200 dps (produces positive innovation towards 0)
-    for (int step = 0; step < 100; step++) {
-        ladrcStepAxis(FD_ROLL, 0.0f, 200.0f, 500.0f, 1.0f, nullptr, nullptr, nullptr, nullptr);
-        ladrcPostMixerUpdate(1.0f, true);
-    }
-    // Wound-up negative disturbance must have unwound towards 0!
-    EXPECT_GT(st->z3, -10.0f);
+    EXPECT_LE(fabsf(st->distTermSum), 400.0f + 1e-3f);
+    EXPECT_LE(fabsf(st->uRealNorm), 0.25f + 1e-3f);
 }
 
 TEST_F(LadrcTest, testLiftoffStateAndGroundWcAttenuation) {
     ladrcProfile_t *prof = ladrcProfilesMutable(0);
+    prof->manual_override = 1;
     prof->ground_wc_pct = 50; // 50% wc on ground
     prof->axis[FD_ROLL].order = LADRC_ORDER_2;
     prof->axis[FD_ROLL].wc_deci = 200; // 20 rad/s -> wcEff = 10 rad/s on ground
@@ -371,8 +343,7 @@ TEST_F(LadrcTest, testLiftoffStateAndGroundWcAttenuation) {
     EXPECT_FALSE(ladrcIsAirborne());
 
     // On ground with ground_wc_pct = 50:
-    // uP = (wcEff^2 * error) / b0, where wcEff = 20 * 0.50 = 10 rad/s -> wcEff^2 = 100
-    // Compared to airborne (wc = 20 -> wc^2 = 400), uP should be 100/400 = 25% (wcEff^2)
+    // INDI uP = (wcEff * (r - omegaFilt)) / b0, so uP scales linearly 50%
     float pGrounded = 0.0f;
     ladrcStepAxisEx(FD_ROLL, 100.0f, 0.0f, 500.0f, 1.0f, 0.0f, LADRC_RESET_NONE,
                     &pGrounded, nullptr, nullptr, nullptr);
@@ -386,7 +357,7 @@ TEST_F(LadrcTest, testLiftoffStateAndGroundWcAttenuation) {
     ladrcStepAxisEx(FD_ROLL, 100.0f, 0.0f, 500.0f, 1.0f, 0.0f, LADRC_RESET_NONE,
                     &pAirborne, nullptr, nullptr, nullptr);
 
-    EXPECT_NEAR(pGrounded / pAirborne, 0.25f, 0.02f);
+    EXPECT_NEAR(pGrounded / pAirborne, 0.50f, 0.02f);
 
     // Now test liftoff state transition via throttle trigger
     ladrcSetAirborne(false);
@@ -409,4 +380,383 @@ TEST_F(LadrcTest, testLiftoffStateAndGroundWcAttenuation) {
     ladrcStepAxisEx(FD_ROLL, 100.0f, 0.0f, 500.0f, 1.0f, 0.0f, LADRC_RESET_NONE,
                     &pRamped, nullptr, nullptr, nullptr);
     EXPECT_NEAR(pRamped, pAirborne, 1.0f);
+}
+
+TEST_F(LadrcTest, testPhaseMatchedBiquadLpfZeroPhaseDiffGyroVsDshotRpm) {
+    ladrcProfile_t *prof = ladrcProfilesMutable(0);
+    prof->prop_size_deci_in = 50; // 5.0" -> f_indi = 90 Hz
+    prof->auw_centi_kg = 65;      // 0.65 kg -> b0_roll = 35.0 kdeg/s^2
+    prof->agility_pct = 100;
+    prof->authority_trim_pct = 100;
+    prof->manual_override = 0;
+
+    const float dt = 0.0003125f; // 3.2 kHz
+    ladrcSetFixedWing(false);
+    ladrcInit(0, dt);
+    ladrcSetDshotFeedbackStatus(true, 4);
+
+    // Feed an ideal instantaneous plant: omegaDot(t) = b0 * u(t)
+    // With twin phase-matched 2nd-order Butterworth SVF Biquad LPFs at f_indi = 90 Hz:
+    // Both omegaFilt and uMeasFilt undergo identical phase delay, so d(omegaFilt)/dt == b0 * uMeasFilt!
+    const float b0 = ladrcGetAxisState(FD_ROLL)->b0Nom;
+    float yKdeg = 0.0f;
+    float maxDiff = 0.0f;
+    for (int k = 0; k < 400; k++) {
+        const float uSin = 0.3f * sinf(2.0f * M_PIf * 15.0f * (k * dt));
+        yKdeg += dt * (b0 * uSin);
+        ladrcSetAxisActuatorFeedback(FD_ROLL, uSin, uSin, true);
+        ladrcStepAxisEx(FD_ROLL, 0.0f, yKdeg * 1000.0f, 500.0f, 1.0f, 0.0f, LADRC_RESET_NONE,
+                        nullptr, nullptr, nullptr, nullptr);
+        ladrcPostMixerUpdate(1.0f, true);
+
+        if (k > 100) {
+            const ladrcRuntimeAxis_t *st = ladrcGetAxisState(FD_ROLL);
+            const float diff = fabsf(st->z2 - b0 * (st->distTermSum / PID_MIXER_SCALING));
+            if (diff > maxDiff) {
+                maxDiff = diff;
+            }
+        }
+    }
+    EXPECT_LT(maxDiff, 0.15f);
+}
+
+TEST_F(LadrcTest, testFiveInchLightQuadStepAndDisturbance) {
+    ladrcProfile_t *prof = ladrcProfilesMutable(0);
+    prof->prop_size_deci_in = 50; // 5.0"
+    prof->auw_centi_kg = 65;      // 0.65 kg
+    prof->agility_pct = 100;
+    prof->authority_trim_pct = 100;
+    prof->manual_override = 0;
+    prof->disturbance_limit = 800;
+
+    const float dt = 0.0003125f; // 3.2 kHz
+    ladrcSetFixedWing(false);
+    ladrcInit(0, dt);
+    ladrcSetDshotFeedbackStatus(true, 4);
+
+    // 5" light quad: tau_m = 15 ms, 20% b0 mismatch + constant disturbance
+    const float tauM = 0.015f;
+    const float b0True = 42.0f; // nominal is 35.0
+    const float dExt = 3.5f;    // 3500 deg/s^2 torque offset
+    float yKdeg = 0.0f;
+    float uMotor = 0.0f;
+    const float setpointDps = 300.0f;
+
+    for (int step = 0; step < 3200; step++) { // 1.0 s
+        ladrcSetAxisActuatorFeedback(FD_ROLL, uMotor, uMotor, true);
+        const float sum = ladrcStepAxis(FD_ROLL, setpointDps, yKdeg * 1000.0f, 500.0f, 1.0f,
+                                        nullptr, nullptr, nullptr, nullptr);
+        const float uCmd = sum / PID_MIXER_SCALING;
+        uMotor += (dt / (dt + tauM)) * (uCmd - uMotor);
+        yKdeg += dt * (b0True * uMotor + dExt);
+        ladrcPostMixerUpdate(1.0f, true);
+    }
+
+    EXPECT_NEAR(yKdeg * 1000.0f, setpointDps, 1.0f);
+    EXPECT_EQ(indiGetFeedbackMode(), INDI_FEEDBACK_DSHOT_RPM);
+    EXPECT_FALSE(indiIsDshotWarningActive());
+}
+
+TEST_F(LadrcTest, testTwentyInchHeavyLiftQuad90msLagZeroWobble) {
+    ladrcProfile_t *prof = ladrcProfilesMutable(0);
+    prof->prop_size_deci_in = 200; // 20.0" -> f_indi = 22.5 Hz, tau_act ~ 90.9 ms
+    prof->auw_centi_kg = 1800;     // 18.00 kg -> realistic heavy-lift quad
+    prof->agility_pct = 100;
+    prof->authority_trim_pct = 100;
+    prof->manual_override = 0;
+    prof->disturbance_limit = 800;
+
+    const float dt = 0.000625f; // 1.6 kHz
+    ladrcSetFixedWing(false);
+    ladrcInit(0, dt);
+    ladrcSetDshotFeedbackStatus(false, 0); // Fallback actuator model!
+
+    const float tauM = 0.090f; // 90 ms heavy-prop lag
+    const float b0True = 22.0f; // realistic 1g-capable 20" 18 kg plant with default b0Nom
+    const float dExt = 0.6f; // steady payload CG offset torque
+    float yKdeg = 0.0f;
+    float uMotor = 0.0f;
+    float peakDps = 0.0f;
+    float tailMinDps = 1e9f;
+    float tailMaxDps = -1e9f;
+    const float setpointDps = 150.0f;
+
+    for (int step = 0; step < 3200; step++) { // 2.0 s
+        const float sum = ladrcStepAxis(FD_ROLL, setpointDps, yKdeg * 1000.0f, 500.0f, 1.0f,
+                                        nullptr, nullptr, nullptr, nullptr);
+        const float uCmd = sum / PID_MIXER_SCALING;
+        ladrcSetAxisActuatorFeedback(FD_ROLL, uCmd, 0.0f, false);
+        uMotor += (dt / (dt + tauM)) * (uCmd - uMotor);
+        yKdeg += dt * (b0True * uMotor + dExt);
+        ladrcPostMixerUpdate(1.0f, true);
+
+        const float rateDps = yKdeg * 1000.0f;
+        if (rateDps > peakDps) {
+            peakDps = rateDps;
+        }
+        if (step >= 2400) { // final 0.5 s settled window
+            if (rateDps < tailMinDps) {
+                tailMinDps = rateDps;
+            }
+            if (rateDps > tailMaxDps) {
+                tailMaxDps = rateDps;
+            }
+        }
+    }
+
+    EXPECT_NEAR(yKdeg * 1000.0f, setpointDps, 2.0f);
+    // Zero wobble: overshoot < 15% and peak-to-peak ripple in final 0.5s < 1.0 deg/s
+    EXPECT_LT(peakDps, setpointDps * 1.15f);
+    EXPECT_LT(tailMaxDps - tailMinDps, 1.0f);
+}
+
+TEST_F(LadrcTest, testFallbackActuatorModelAndDshotWarningTriggers) {
+    ladrcProfile_t *prof = ladrcProfilesMutable(0);
+    prof->prop_size_deci_in = 100; // 10.0"
+    prof->manual_override = 0;
+
+    const float dt = 0.000625f;
+    // Case 1: Multirotor without DShot RPM -> fallback actuator model + warning active
+    ladrcSetFixedWing(false);
+    ladrcInit(0, dt);
+    ladrcSetDshotFeedbackStatus(false, 0);
+    EXPECT_EQ(indiGetFeedbackMode(), INDI_FEEDBACK_ACTUATOR_MODEL);
+    EXPECT_EQ(indiGetDshotActiveMotorCount(), 0);
+    EXPECT_TRUE(indiIsDshotWarningActive());
+    EXPECT_NEAR(indiGetLpfHz(), 45.0f, 0.01f);
+    EXPECT_NEAR(indiGetRpmMinHz(), 50.0f, 0.01f);
+
+    // Case 2: Multirotor with DShot configured ON on USB without battery -> standby, NO false warning
+    ladrcSetDshotFeedbackStatus(false, 0);
+    ladrcSetDshotConfiguredStatus(true, false);
+    EXPECT_EQ(indiGetFeedbackMode(), INDI_FEEDBACK_ACTUATOR_MODEL);
+    EXPECT_TRUE(indiIsDshotStandbyNoBattery());
+    EXPECT_FALSE(indiIsDshotWarningActive());
+
+    // Case 2b: Multirotor with DShot configured ON and battery connected, still 0 eRPM -> warning active
+    ladrcSetDshotConfiguredStatus(true, true);
+    EXPECT_FALSE(indiIsDshotStandbyNoBattery());
+    EXPECT_TRUE(indiIsDshotWarningActive());
+    ladrcSetDshotConfiguredStatus(false, true);
+
+    // Case 3: Multirotor with DShot RPM -> DSHOT_RPM mode + no warning
+    ladrcSetDshotFeedbackStatus(true, 4);
+    EXPECT_EQ(indiGetFeedbackMode(), INDI_FEEDBACK_DSHOT_RPM);
+    EXPECT_EQ(indiGetDshotActiveMotorCount(), 4);
+    EXPECT_FALSE(indiIsDshotWarningActive());
+
+    // Case 4: Fixed-wing -> actuator model (tau_act = 0.030s) and NO DShot warning
+    ladrcSetDshotFeedbackStatus(false, 0);
+    ladrcSetFixedWing(true);
+    ladrcInit(0, dt);
+    EXPECT_EQ(indiGetFeedbackMode(), INDI_FEEDBACK_ACTUATOR_MODEL);
+    EXPECT_FALSE(indiIsDshotWarningActive());
+    EXPECT_NEAR(ladrcGetAxisState(FD_ROLL)->tauActS, 0.030f, 1e-4f);
+    ladrcSetFixedWing(false);
+}
+
+TEST_F(LadrcTest, testRollPitchYawSaturationPriority) {
+    // QuadX mixer: { throttle, roll, pitch, yaw }
+    const float quadX[4][4] = {
+        { 1.0f, -1.0f,  1.0f, -1.0f }, // REAR_R
+        { 1.0f, -1.0f, -1.0f,  1.0f }, // FRONT_R
+        { 1.0f,  1.0f,  1.0f,  1.0f }, // REAR_L
+        { 1.0f,  1.0f, -1.0f, -1.0f }, // FRONT_L
+    };
+
+    float motorMix[4] = { 0 };
+    float mixMin = 0.0f, mixMax = 0.0f, rawRange = 0.0f;
+
+    // Request Roll=0.35, Pitch=0.25, Yaw=0.80 -> rawRange = 1.40 - (-0.90) = 2.30 > 1.0!
+    // Roll=0.35 keeps 100%, Pitch scales to 0.15, Yaw fits 0.15 in the non-opposing QuadX nullspace (span = 1.0)!
+    indiAllocatePriorityMix(quadX, 4, 0.35f, 0.25f, 0.80f, motorMix, &mixMin, &mixMax, &rawRange);
+    EXPECT_NEAR(rawRange, 2.30f, 1e-4f);
+    EXPECT_LE(mixMax - mixMin, 1.0f + 1e-5f);
+
+    float axes[XYZ_AXIS_COUNT] = { 0 };
+    indiProjectMotorOutputsToAxes(motorMix, quadX, 4, axes);
+    EXPECT_NEAR(axes[FD_ROLL], 0.35f, 1e-4f);  // Roll preserved 100%!
+    EXPECT_NEAR(axes[FD_PITCH], 0.15f, 1e-4f); // Pitch gets remaining 0.15 headroom!
+    EXPECT_NEAR(axes[FD_YAW], 0.15f, 1e-4f);   // Yaw fits 0.15 without clipping Roll or Pitch!
+
+    // Request Roll=0.20, Pitch=0.15, Yaw=0.50 -> Roll+Pitch keep 100%, Yaw scales to 0.30 (span = 0.65 - (-0.35) = 1.0)!
+    indiAllocatePriorityMix(quadX, 4, 0.20f, 0.15f, 0.50f, motorMix, &mixMin, &mixMax, &rawRange);
+    EXPECT_LE(mixMax - mixMin, 1.0f + 1e-5f);
+    indiProjectMotorOutputsToAxes(motorMix, quadX, 4, axes);
+    EXPECT_NEAR(axes[FD_ROLL], 0.20f, 1e-4f);
+    EXPECT_NEAR(axes[FD_PITCH], 0.15f, 1e-4f);
+    EXPECT_NEAR(axes[FD_YAW], 0.30f, 1e-4f);
+}
+
+TEST_F(LadrcTest, testBumplessLiveReconfigurePreservesTrimAndAvoidsDerivativeSpike) {
+    ladrcProfile_t *prof = ladrcProfilesMutable(0);
+    prof->prop_size_deci_in = 50;
+    prof->auw_centi_kg = 65;
+    prof->agility_pct = 100;
+    prof->authority_trim_pct = 100;
+    prof->manual_override = 0;
+    prof->disturbance_limit = 800;
+
+    const float dt = 0.00025f; // 4 kHz
+    ladrcSetFixedWing(false);
+    ladrcInit(0, dt);
+    ladrcSetDshotFeedbackStatus(false, 0);
+
+    // Settle steady flight at 200 deg/s against a steady disturbance
+    const float gyroRateDps = 200.0f;
+    const float spDps = 200.0f;
+    float pOut = 0.0f, dOut = 0.0f, fOut = 0.0f, distOut = 0.0f;
+    for (int i = 0; i < 600; i++) {
+        const float sum = ladrcStepAxis(FD_ROLL, spDps, gyroRateDps, 500.0f, 1.0f,
+                                        &pOut, &dOut, &fOut, &distOut);
+        ladrcSetAxisActuatorFeedback(FD_ROLL, sum / PID_MIXER_SCALING, 0.0f, false);
+        ladrcPostMixerUpdate(1.0f, true);
+    }
+    const ladrcRuntimeAxis_t *st = ladrcGetAxisState(FD_ROLL);
+    ASSERT_NE(st, nullptr);
+    const float preDistTrim = st->distTermSum;
+    const float preCmd = st->uCmdNorm;
+
+    // Live reconfigure while flying: must preserve filter states & trim without derivative spike
+    prof->prop_size_deci_in = 70;
+    prof->agility_pct = 120;
+    ladrcReconfigureLive(0, dt);
+
+    const float postSum = ladrcStepAxis(FD_ROLL, spDps, gyroRateDps, 500.0f, 1.0f,
+                                        &pOut, &dOut, &fOut, &distOut);
+    EXPECT_NEAR(distOut, preDistTrim, 5.0f);
+    EXPECT_NEAR(dOut, 0.0f, 1.0f);
+    EXPECT_NEAR(fOut, 0.0f, 1.0f);
+    EXPECT_NEAR(postSum / PID_MIXER_SCALING, preCmd, 0.05f);
+}
+
+TEST_F(LadrcTest, testResetStatePreservesDisarmedGroundedAirborneFalse) {
+    ladrcProfile_t *prof = ladrcProfilesMutable(0);
+    prof->prop_size_deci_in = 50;
+    prof->manual_override = 0;
+
+    const float dt = 0.0005f;
+    ladrcInit(0, dt);
+    ladrcSetAirborne(false);
+    EXPECT_FALSE(ladrcIsAirborne());
+
+    // Calling ladrcResetState while disarmed must keep airborneState == false
+    ladrcResetState();
+    EXPECT_FALSE(ladrcIsAirborne());
+
+    // High gyro without sufficient throttle (< 0.08) must NOT trigger liftoff
+    for (int i = 0; i < 200; i++) {
+        ladrcUpdateLiftoffState(0.05f, 80.0f, dt);
+    }
+    EXPECT_FALSE(ladrcIsAirborne());
+
+    // Throttle >= 0.08 + gyroPeak >= 50 dps must require 50ms sustained before liftoff
+    for (int i = 0; i < 50; i++) { // 25 ms
+        ladrcUpdateLiftoffState(0.10f, 60.0f, dt);
+    }
+    EXPECT_FALSE(ladrcIsAirborne());
+    for (int i = 0; i < 60; i++) { // +30 ms = 55 ms
+        ladrcUpdateLiftoffState(0.10f, 60.0f, dt);
+    }
+    EXPECT_TRUE(ladrcIsAirborne());
+
+    // Restore airborne default for subsequent standalone tests
+    ladrcSetAirborne(true);
+}
+
+TEST_F(LadrcTest, testNonOrthogonalVtailProjectionAndClimbThrottleSafeYawAllocation) {
+    const float vtail[4][4] = {
+        { 1.0f, -0.58f,  0.58f,  1.0f }, // REAR_R
+        { 1.0f, -0.46f, -0.39f, -0.5f }, // FRONT_R
+        { 1.0f,  0.58f,  0.58f, -1.0f }, // REAR_L
+        { 1.0f,  0.46f, -0.39f,  0.5f }, // FRONT_L
+    };
+
+    float motorOutputs[4];
+    const float trueThr = 0.55f;
+    const float trueRoll = 0.12f;
+    const float truePitch = -0.18f;
+    const float trueYaw = 0.25f;
+    for (int i = 0; i < 4; i++) {
+        motorOutputs[i] = trueThr * vtail[i][0] + trueRoll * vtail[i][1] + truePitch * vtail[i][2] + trueYaw * vtail[i][3];
+    }
+
+    float axes[XYZ_AXIS_COUNT] = { 0 };
+    indiProjectMotorOutputsToAxes(motorOutputs, vtail, 4, axes);
+    EXPECT_NEAR(axes[FD_ROLL], trueRoll, 1e-3f);
+    EXPECT_NEAR(axes[FD_PITCH], truePitch, 1e-3f);
+    EXPECT_NEAR(axes[FD_YAW], trueYaw, 1e-3f);
+
+    // Climb-throttle-safe yaw allocation on QuadX: at 85% climb throttle, yaw must NOT drop collective throttle!
+    const float quadX[4][4] = {
+        { 1.0f, -1.0f,  1.0f, -1.0f },
+        { 1.0f, -1.0f, -1.0f,  1.0f },
+        { 1.0f,  1.0f,  1.0f,  1.0f },
+        { 1.0f,  1.0f, -1.0f, -1.0f },
+    };
+    float motorMix[4] = { 0 };
+    float thrOut = 0.0f, mixMin = 0.0f, mixMax = 0.0f, rawRange = 0.0f;
+    indiAllocatePriorityMixWithThrottle(quadX, 4, 0.85f, 1, true,
+                                        0.05f, 0.05f, 0.60f,
+                                        motorMix, &thrOut, &mixMin, &mixMax, &rawRange);
+    EXPECT_GE(thrOut, 0.85f - 1e-5f);
+    for (int i = 0; i < 4; i++) {
+        const float m = thrOut + motorMix[i];
+        EXPECT_GE(m, -1e-5f);
+        EXPECT_LE(m, 1.0f + 1e-5f);
+    }
+    indiProjectMotorOutputsToAxes(motorMix, quadX, 4, axes);
+    EXPECT_NEAR(axes[FD_ROLL], 0.05f, 1e-4f);
+    EXPECT_NEAR(axes[FD_PITCH], 0.05f, 1e-4f);
+    EXPECT_NEAR(axes[FD_YAW], 0.05f, 1e-4f); // Roll+Pitch take 0.10 headroom -> remaining 0.05 for Yaw without dropping climb throttle
+
+    // Low-throttle airmode yaw collective shift capped at +0.10
+    indiAllocatePriorityMixWithThrottle(quadX, 4, 0.05f, 1, true,
+                                        0.0f, 0.0f, 0.60f,
+                                        motorMix, &thrOut, &mixMin, &mixMax, &rawRange);
+    EXPECT_LE(thrOut, 0.15f + 1e-5f);
+    for (int i = 0; i < 4; i++) {
+        const float m = thrOut + motorMix[i];
+        EXPECT_GE(m, -1e-5f);
+        EXPECT_LE(m, 1.0f + 1e-5f);
+    }
+}
+
+TEST_F(LadrcTest, testNaNHardeningInConstrainfAndLadrcStep) {
+    float nanVal = 0.0f;
+    float posInf = 0.0f;
+    float negInf = 0.0f;
+    const uint32_t nanBits = 0x7FC00000U;
+    const uint32_t posInfBits = 0x7F800000U;
+    const uint32_t negInfBits = 0xFF800000U;
+    memcpy(&nanVal, &nanBits, sizeof(nanVal));
+    memcpy(&posInf, &posInfBits, sizeof(posInf));
+    memcpy(&negInf, &negInfBits, sizeof(negInf));
+
+    EXPECT_TRUE(floatIsNaNBits(nanVal));
+    EXPECT_FALSE(floatIsFiniteBits(nanVal));
+    EXPECT_FALSE(floatIsFiniteBits(posInf));
+    EXPECT_FALSE(floatIsFiniteBits(negInf));
+    EXPECT_TRUE(floatIsFiniteBits(1.25f));
+
+    EXPECT_FLOAT_EQ(constrainf(nanVal, -1.0f, 1.0f), 0.0f);
+    EXPECT_FLOAT_EQ(constrainf(nanVal, 0.5f, 1.5f), 0.5f);
+    EXPECT_FLOAT_EQ(constrainf(posInf, -1.0f, 1.0f), 1.0f);
+    EXPECT_FLOAT_EQ(constrainf(negInf, -1.0f, 1.0f), -1.0f);
+
+    ladrcInit(0, 0.0005f);
+    float pOut = 0.0f, dOut = 0.0f, fOut = 0.0f, distOut = 0.0f;
+    const float out = ladrcStepAxisEx(FD_ROLL, nanVal, nanVal, 500.0f, nanVal, 1.0f, LADRC_RESET_NONE,
+                                      &pOut, &dOut, &fOut, &distOut);
+    EXPECT_TRUE(floatIsFiniteBits(out));
+    EXPECT_TRUE(floatIsFiniteBits(pOut));
+    EXPECT_TRUE(floatIsFiniteBits(dOut));
+    EXPECT_TRUE(floatIsFiniteBits(fOut));
+    EXPECT_TRUE(floatIsFiniteBits(distOut));
+    ladrcPostMixerUpdate(1.0f, true);
+
+    const float recOut = ladrcStepAxisEx(FD_ROLL, 100.0f, 0.0f, 500.0f, 1.0f, 1.0f, LADRC_RESET_NONE,
+                                         &pOut, &dOut, &fOut, &distOut);
+    EXPECT_TRUE(floatIsFiniteBits(recOut));
+    EXPECT_GT(recOut, 0.0f);
 }

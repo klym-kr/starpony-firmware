@@ -135,7 +135,7 @@ void updateDshotTelemetryQuality(dshotTelemetryQuality_t *qualityStats, bool pac
 #endif // USE_DSHOT_TELEMETRY
 
 void initDshotTelemetry(const timeUs_t looptimeUs);
-void updateDshotTelemetry(void);
+void updateDshotTelemetry(timeUs_t currentTimeUs);
 
 bool isDshotBitbangActive(const motorDevConfig_t *motorDevConfig);
 
@@ -146,6 +146,7 @@ float getMotorFrequencyHz(uint8_t motorIndex);
 float getMinMotorFrequencyHz(void);
 
 bool isDshotMotorTelemetryActive(uint8_t motorIndex);
+bool isDshotMotorTelemetryFresh(uint8_t motorIndex, timeUs_t currentTimeUs);
 bool isDshotTelemetryActive(void);
 void dshotCleanTelemetryData(void);
 

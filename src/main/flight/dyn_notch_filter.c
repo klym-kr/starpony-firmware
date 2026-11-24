@@ -43,11 +43,15 @@
 #include "common/sdft.h"
 #include "common/utils.h"
 
+#include "config/config.h"
 #include "config/feature.h"
 
+#include "drivers/dshot.h"
 #include "drivers/time.h"
 
 #include "fc/core.h"
+
+#include "flight/ladrc.h"
 
 #include "sensors/gyro.h"
 
@@ -167,36 +171,61 @@ void dynNotchInit(const dynNotchConfig_t *config, const float dt)
     const float looprateHz = 1.0f / dt;
     const float nyquistHz = looprateHz / 2.0f;
 
-    // Disable dynamic notch if dynNotchUpdate() would run at less than 2kHz
-    if (looprateHz < DYN_NOTCH_UPDATE_MIN_HZ) {
+#ifdef USE_LADRC
+    const ladrcProfile_t *ladrcProfile = ladrcProfiles(systemConfig()->pidProfileIndex);
+    const bool autoIndiNotch = !ladrcProfile->manual_override;
+#else
+    const bool autoIndiNotch = false;
+#endif
+
+    const float minLooprateHz = autoIndiNotch ? 1000.0f : DYN_NOTCH_UPDATE_MIN_HZ;
+    if (looprateHz < minLooprateHz) {
         dynNotch.count = 0;
         return;
     }
 
-    // If dynamic notch is available, initialise so it can be activated at any time
-    dynNotch.q = config->dyn_notch_q / 100.0f;
-    dynNotch.minHz = config->dyn_notch_min_hz;
-    dynNotch.maxHz = MAX(dynNotch.minHz, config->dyn_notch_max_hz);
-    dynNotch.maxHz = MIN(dynNotch.maxHz, nyquistHz); // Ensure to not go above the nyquist limit
-    dynNotch.count = config->dyn_notch_count;
+#ifdef USE_LADRC
+    if (autoIndiNotch) {
+        float minHz = 80.0f;
+        float maxHz = 500.0f;
+        indiComputeDynNotchRangeHz(ladrcProfile, &minHz, &maxHz);
+#ifdef USE_DSHOT_TELEMETRY
+        const bool dshotTelem = useDshotTelemetry;
+#else
+        const bool dshotTelem = false;
+#endif
+        dynNotch.q = (config->dyn_notch_q > 0) ? (config->dyn_notch_q / 100.0f) : 3.0f;
+        dynNotch.minHz = minHz;
+        dynNotch.maxHz = MIN(MAX(minHz, maxHz), nyquistHz);
+        if (dshotTelem && looprateHz < 2000.0f) {
+            dynNotch.count = 0;
+            return;
+        }
+        dynNotch.count = dshotTelem ? 1 : 3;
+    } else
+#endif
+    {
+        // If dynamic notch is available, initialise so it can be activated at any time
+        dynNotch.q = config->dyn_notch_q / 100.0f;
+        dynNotch.minHz = config->dyn_notch_min_hz;
+        dynNotch.maxHz = MAX(dynNotch.minHz, config->dyn_notch_max_hz);
+        dynNotch.maxHz = MIN(dynNotch.maxHz, nyquistHz); // Ensure to not go above the nyquist limit
+        dynNotch.count = config->dyn_notch_count;
+    }
     dynNotch.dt = dt;
     dynNotch.maxCenterFreq = 0;
 
     sampleCount = MAX(1, nyquistHz / dynNotch.maxHz); // maxHz = 600 & looprateHz = 8000 -> sampleCount = 6
     sampleCountRcp = 1.0f / sampleCount;
 
-    sdftSampleRateHz = looprateHz / sampleCount;
-    // eg 8k, user max 600hz, int(4000/600) = 6 (6.666), sdftSampleRateHz = 1333hz, range 666Hz
-    // eg 4k, user max 600hz, int(2000/600) = 3 (3.333), sdftSampleRateHz = 1333hz, range 666Hz
-    // eg 2k, user max 600hz, int(1000/600) = 1 (1.666)  sdftSampleRateHz = 2000hz, range 1000Hz
-    // eg 2k, user max 400hz, int(1000/400) = 2 (2.5)    sdftSampleRateHz = 1000hz, range 500Hz
-    // eg 1k, user max 600hz, int(500/500)  = 1 (1.0)    sdftSampleRateHz = 1000hz, range 500Hz
+    const int effectiveSampleCount = MAX(sampleCount, DYN_NOTCH_CALC_TICKS);
+    sdftSampleRateHz = looprateHz / effectiveSampleCount;
     // The upper limit of DN is always going to be the Nyquist frequency (= sampleRate / 2)
 
     sdftResolutionHz = sdftSampleRateHz / SDFT_SAMPLE_SIZE; // 18.5hz per bin at 8k and 600Hz maxHz
     sdftStartBin = MAX(1, lrintf(dynNotch.minHz / sdftResolutionHz)); // can't use bin 0 because it is DC.
     sdftEndBin = MIN(SDFT_BIN_COUNT - 1, lrintf(dynNotch.maxHz / sdftResolutionHz)); // can't use more than SDFT_BIN_COUNT bins.
-    pt1LooptimeS = DYN_NOTCH_CALC_TICKS / looprateHz;
+    pt1LooptimeS = effectiveSampleCount / looprateHz;
 
     for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
         sdftInit(&sdft[axis], sdftStartBin, sdftEndBin, sampleCount);
@@ -224,12 +253,13 @@ FAST_CODE void dynNotchUpdate(void)
 {
     // samples should have been pushed by `dynNotchPush`
     // if gyro sampling is > 1kHz, accumulate and average multiple gyro samples
-    if (sampleIndex == sampleCount) {
+    if (sampleIndex >= sampleCount && state.tick == 0) {
+        const float invSampleCount = (sampleIndex > 0) ? (1.0f / (float)sampleIndex) : sampleCountRcp;
         sampleIndex = 0;
 
         // calculate mean value of accumulated samples
         for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
-            sampleAvg[axis] = sampleAccumulator[axis] * sampleCountRcp;
+            sampleAvg[axis] = sampleAccumulator[axis] * invSampleCount;
             sampleAccumulator[axis] = 0;
             if (axis == gyro.gyroDebugAxis) {
                 DEBUG_SET(DEBUG_FFT, 2, lrintf(sampleAvg[axis]));
@@ -245,8 +275,10 @@ FAST_CODE void dynNotchUpdate(void)
 
     // 2us @ F722
     // SDFT processing in batches to synchronize with incoming downsampled data
-    for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
-        sdftPushBatch(&sdft[axis], sampleAvg[axis], sampleIndex);
+    if (sampleIndex < sampleCount) {
+        for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
+            sdftPushBatch(&sdft[axis], sampleAvg[axis], sampleIndex);
+        }
     }
     sampleIndex++;
 
@@ -423,6 +455,21 @@ FAST_CODE float dynNotchFilter(const int axis, float value)
 bool isDynNotchActive(void)
 {
     return dynNotch.count > 0;
+}
+
+uint8_t dynNotchGetActiveCount(void)
+{
+    return (uint8_t)dynNotch.count;
+}
+
+uint16_t dynNotchGetMinHz(void)
+{
+    return (uint16_t)lrintf(dynNotch.minHz);
+}
+
+uint16_t dynNotchGetMaxHz(void)
+{
+    return (uint16_t)lrintf(dynNotch.maxHz);
 }
 
 int getMaxFFT(void)

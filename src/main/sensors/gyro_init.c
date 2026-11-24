@@ -71,6 +71,14 @@
 #include "flight/rpm_filter.h"
 #endif
 
+#ifdef USE_DSHOT_TELEMETRY
+#include "drivers/dshot.h"
+#endif
+
+#ifdef USE_LADRC
+#include "flight/ladrc.h"
+#endif
+
 #include "pg/gyrodev.h"
 
 #include "sensors/gyro.h"
@@ -84,6 +92,8 @@
 #define GYRO_BUF_SIZE 32
 
 static uint8_t gyroDetectedFlags = 0;
+static uint16_t activeGyroLpf1Hz = 0;
+static uint16_t activeGyroLpf2Hz = 0;
 
 static uint16_t calculateNyquistAdjustedNotchHz(uint16_t notchHz, uint16_t notchCutoffHz)
 {
@@ -225,12 +235,28 @@ static void dynLpfFilterInit(void)
     gyro.dynLpfMin = gyroConfig()->gyro_lpf1_dyn_min_hz;
     gyro.dynLpfMax = gyroConfig()->gyro_lpf1_dyn_max_hz;
     gyro.dynLpfCurveExpo = gyroConfig()->gyro_lpf1_dyn_expo;
+
+#ifdef USE_LADRC
+    const ladrcProfile_t *ladrcProfile = ladrcProfiles(systemConfig()->pidProfileIndex);
+    if (!ladrcProfile->manual_override && gyro.dynLpfFilter != DYN_LPF_NONE && gyro.targetLooptime > 0) {
+        const float minGyroLpfHz = 4.0f * indiComputeFIndiHz(ladrcProfile);
+        const uint32_t gyroFrequencyNyquist = (1000000 / 2 / gyro.targetLooptime) * 0.95f;
+        const uint16_t minFloorHz = (uint16_t)ceilf(minGyroLpfHz);
+        if (minFloorHz > gyroFrequencyNyquist) {
+            gyro.dynLpfFilter = DYN_LPF_NONE;
+        } else {
+            gyro.dynLpfMin = MAX(gyro.dynLpfMin, minFloorHz);
+            gyro.dynLpfMax = MAX(gyro.dynLpfMax, gyro.dynLpfMin);
+        }
+    }
+#endif
 }
 #endif
 
 void gyroInitFilters(void)
 {
     uint16_t gyro_lpf1_init_hz = gyroConfig()->gyro_lpf1_static_hz;
+    uint16_t gyro_lpf2_init_hz = gyroConfig()->gyro_lpf2_static_hz;
 
 #ifdef USE_DYN_LPF
     if (gyroConfig()->gyro_lpf1_dyn_min_hz > 0) {
@@ -238,19 +264,47 @@ void gyroInitFilters(void)
     }
 #endif
 
-    gyroInitLowpassFilterLpf(
+#ifdef USE_LADRC
+    const ladrcProfile_t *ladrcProfile = ladrcProfiles(systemConfig()->pidProfileIndex);
+    if (!ladrcProfile->manual_override) {
+        const float minGyroLpfHz = 4.0f * indiComputeFIndiHz(ladrcProfile);
+        const uint16_t minFloorHz = (uint16_t)ceilf(minGyroLpfHz);
+        if (gyro.targetLooptime > 0) {
+            const uint32_t gyroNyquist = (1000000 / 2 / gyro.targetLooptime) * 0.95f;
+            if (gyro_lpf1_init_hz == 0) {
+                gyro_lpf1_init_hz = (minFloorHz <= gyroNyquist) ? minFloorHz : 0;
+            } else {
+                gyro_lpf1_init_hz = (minFloorHz <= gyroNyquist) ? MAX(gyro_lpf1_init_hz, minFloorHz) : 0;
+            }
+        }
+        if (gyro.sampleLooptime > 0) {
+            const uint32_t sampleNyquist = (1000000 / 2 / gyro.sampleLooptime) * 0.95f;
+            if (activePidLoopDenom > 1) {
+                const float D = constrainf(ladrcProfile->prop_size_deci_in * 0.1f, 3.0f, 30.0f);
+                const uint16_t aaHz = (D >= 10.0f) ? 500 : 1000;
+                gyro_lpf2_init_hz = (uint16_t)MIN((uint32_t)aaHz, sampleNyquist);
+            } else if (gyro_lpf2_init_hz > 0) {
+                gyro_lpf2_init_hz = (minFloorHz <= sampleNyquist) ? MAX(gyro_lpf2_init_hz, minFloorHz) : 0;
+            }
+        }
+    }
+#endif
+
+    const bool lpf1Enabled = gyroInitLowpassFilterLpf(
       FILTER_LPF1,
       gyroConfig()->gyro_lpf1_type,
       gyro_lpf1_init_hz,
       gyro.targetLooptime
     );
+    activeGyroLpf1Hz = lpf1Enabled ? gyro_lpf1_init_hz : 0;
 
     gyro.downsampleFilterEnabled = gyroInitLowpassFilterLpf(
       FILTER_LPF2,
       gyroConfig()->gyro_lpf2_type,
-      gyroConfig()->gyro_lpf2_static_hz,
+      gyro_lpf2_init_hz,
       gyro.sampleLooptime
     );
+    activeGyroLpf2Hz = gyro.downsampleFilterEnabled ? gyro_lpf2_init_hz : 0;
 
     gyroInitFilterNotch1(gyroConfig()->gyro_soft_notch_hz_1, gyroConfig()->gyro_soft_notch_cutoff_1);
     gyroInitFilterNotch2(gyroConfig()->gyro_soft_notch_hz_2, gyroConfig()->gyro_soft_notch_cutoff_2);
@@ -790,9 +844,75 @@ uint8_t getGyroDetectedFlags(void)
     return gyroDetectedFlags;
 }
 
+uint16_t gyroGetActiveLpf1Hz(void)
+{
+    return activeGyroLpf1Hz;
+}
+
+uint16_t gyroGetActiveLpf2Hz(void)
+{
+    return activeGyroLpf2Hz;
+}
+
+static float lpfGroupDelayS(int type, uint16_t hz)
+{
+    if (hz == 0) {
+        return 0.0f;
+    }
+    const float w = 2.0f * M_PIf * (float)hz;
+    switch (type) {
+    case FILTER_PT1:
+        return 1.0f / w;
+    case FILTER_PT2:
+        return 2.0f / (w * 1.553773974f);
+    case FILTER_PT3:
+        return 3.0f / (w * 1.961459177f);
+    case FILTER_SVF:
+        return 1.41421356237f / w;
+    default:
+        return 0.0f;
+    }
+}
+
+float gyroComputeUpstreamDelayS(void)
+{
+    // MEMS hardware AAF (~1 ms) + LPF1 + pre-decimation LPF2 + notch low-freq phase delay
+    float delayS = 0.001f;
+    delayS += lpfGroupDelayS(gyroConfig()->gyro_lpf1_type, activeGyroLpf1Hz);
+    if (gyro.downsampleFilterEnabled) {
+        delayS += lpfGroupDelayS(gyroConfig()->gyro_lpf2_type, activeGyroLpf2Hz);
+    }
+#ifdef USE_DYN_NOTCH_FILTER
+    if (isDynNotchActive()) {
+        const float minHz = MAX(20.0f, (float)dynNotchGetMinHz());
+        const float q = MAX(1.0f, dynNotchConfig()->dyn_notch_q * 0.01f);
+        delayS += 0.5f / (2.0f * M_PIf * minHz * q);
+    }
+#endif
+#ifdef USE_RPM_FILTER
+#ifdef USE_DSHOT_TELEMETRY
+    if (useDshotTelemetry && rpmFilterConfig()->rpm_filter_harmonics > 0 && rpmFilterConfig()->rpm_filter_min_hz > 0) {
+        const float rpmMinHz = MAX(20.0f, (float)rpmFilterConfig()->rpm_filter_min_hz);
+        const float rpmQ = MAX(1.0f, rpmFilterConfig()->rpm_filter_q * 0.01f);
+        delayS += 0.5f / (2.0f * M_PIf * rpmMinHz * rpmQ);
+    }
+#endif
+#endif
+    return delayS;
+}
+
 void gyroSetTargetLooptime(uint8_t pidDenom)
 {
     activePidLoopDenom = pidDenom;
+#ifdef USE_LADRC
+    const ladrcProfile_t *ladrcProfile = ladrcProfiles(systemConfig()->pidProfileIndex);
+    if (!ladrcProfile->manual_override && gyro.sampleRateHz > 0) {
+        const float D = constrainf(ladrcProfile->prop_size_deci_in * 0.1f, 3.0f, 30.0f);
+        const float targetHz = (D >= 10.0f) ? 1600.0f : 4000.0f;
+        int autoDenom = (int)lrintf((float)gyro.sampleRateHz / targetHz);
+        activePidLoopDenom = (uint8_t)constrain(MAX((int)pidDenom, autoDenom), 1, 16);
+    }
+#endif
     if (gyro.sampleRateHz) {
         gyro.sampleLooptime = 1e6f / gyro.sampleRateHz;
         gyro.targetLooptime = activePidLoopDenom * 1e6f / gyro.sampleRateHz;

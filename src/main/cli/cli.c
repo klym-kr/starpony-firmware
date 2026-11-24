@@ -110,6 +110,8 @@ bool cliMode = false;
 #include "flight/imu.h"
 #ifdef USE_LADRC
 #include "flight/ladrc.h"
+#include "flight/pid_init.h"
+#include "sensors/gyro_init.h"
 #endif
 #include "flight/mixer.h"
 #include "flight/pid.h"
@@ -614,7 +616,12 @@ static int sprintValuePointer(char *buf, int bufLen, const clivalue_t *var, cons
         case MODE_DIRECT: {
                 char tmp[16];
                 int n;
-                if ((var->type & VALUE_TYPE_MASK) == VAR_UINT32) {
+                const uint16_t scaleFlag = var->type & VALUE_SCALE_MASK;
+                if (scaleFlag == VALUE_SCALE_10) {
+                    n = tfp_sprintf(tmp, "%s%d.%d", (value < 0) ? "-" : "", abs(value) / 10, abs(value) % 10);
+                } else if (scaleFlag == VALUE_SCALE_100) {
+                    n = tfp_sprintf(tmp, "%s%d.%02d", (value < 0) ? "-" : "", abs(value) / 100, abs(value) % 100);
+                } else if ((var->type & VALUE_TYPE_MASK) == VAR_UINT32) {
                     n = tfp_sprintf(tmp, "%u", (uint32_t)value);
                 } else {
                     n = tfp_sprintf(tmp, "%d", value);
@@ -950,10 +957,19 @@ static void cliPrintVarRange(const clivalue_t *var)
 
             break;
         case VAR_UINT8:
-        case VAR_UINT16:
-            cliPrintLinef("Allowed range: %d - %d", var->config.minmaxUnsigned.min, var->config.minmaxUnsigned.max);
-
+        case VAR_UINT16: {
+            const uint16_t scaleFlag = var->type & VALUE_SCALE_MASK;
+            const int min = var->config.minmaxUnsigned.min;
+            const int max = var->config.minmaxUnsigned.max;
+            if (scaleFlag == VALUE_SCALE_10) {
+                cliPrintLinef("Allowed range: %d.%d - %d.%d", min / 10, min % 10, max / 10, max % 10);
+            } else if (scaleFlag == VALUE_SCALE_100) {
+                cliPrintLinef("Allowed range: %d.%02d - %d.%02d", min / 100, min % 100, max / 100, max % 100);
+            } else {
+                cliPrintLinef("Allowed range: %d - %d", min, max);
+            }
             break;
+        }
         default:
             cliPrintLinef("Allowed range: %d - %d", var->config.minmax.min, var->config.minmax.max);
 
@@ -5407,6 +5423,49 @@ static bool cliParseArrayValue(const char *valStr, const clivalue_t *val, void *
     return true;
 }
 
+static bool cliParseScaledDirectValue(const clivalue_t *val, const char *str, int *outValue)
+{
+    const uint16_t scaleFlag = val->type & VALUE_SCALE_MASK;
+    if (scaleFlag == 0) {
+        *outValue = atoi(str);
+        return true;
+    }
+    const float scale = (scaleFlag == VALUE_SCALE_10) ? 10.0f : 100.0f;
+    char *endptr = NULL;
+    const float parsed = strtof(str, &endptr);
+    if (endptr == str || !isfinite(parsed)) {
+        return false;
+    }
+    endptr = skipSpace(endptr);
+    if (*endptr != '\0') {
+        return false;
+    }
+    *outValue = (int)lrintf(parsed * scale);
+    return true;
+}
+
+static void cliPostSetUpdate(const clivalue_t *val)
+{
+#ifdef USE_LADRC
+    if (val->pgn == PG_LADRC_PROFILE) {
+        const uint8_t profIdx = (pidProfileIndexToUse == CURRENT_PROFILE_INDEX) ? getCurrentPidProfileIndex() : (uint8_t)pidProfileIndexToUse;
+        ladrcProfile_t *ladrcProf = ladrcProfilesMutable(profIdx);
+        if (!ladrcProf->manual_override) {
+            indiApplyPhysicalParams(ladrcProf);
+        }
+        if (profIdx == getCurrentPidProfileIndex()) {
+            if (!ARMING_FLAG(ARMED)) {
+                indiRefreshRuntimeRatesAndFilters();
+            } else {
+                ladrcReconfigureLive(profIdx, pidGetDT());
+            }
+        }
+    }
+#else
+    UNUSED(val);
+#endif
+}
+
 RAM_CODE STATIC_UNIT_TESTED void cliSet(const char *cmdName, char *cmdline)
 {
     const uint32_t len = strlen(cmdline);
@@ -5457,13 +5516,13 @@ RAM_CODE STATIC_UNIT_TESTED void cliSet(const char *cmdName, char *cmdline)
                         valueChanged = true;
                     }
                 } else {
-                    int value = atoi(eqptr);
+                    int value = 0;
 
                     int min;
                     int max;
                     getMinMax(val, &min, &max);
 
-                    if (value >= min && value <= max) {
+                    if (cliParseScaledDirectValue(val, eqptr, &value) && value >= min && value <= max) {
                         cliSetVar(val, value);
                         valueChanged = true;
                     }
@@ -5527,6 +5586,7 @@ RAM_CODE STATIC_UNIT_TESTED void cliSet(const char *cmdName, char *cmdline)
         }
 
         if (valueChanged) {
+            cliPostSetUpdate(val);
             cliPrintf("%s set to ", val->name);
             cliPrintVar(cmdName, val, 0);
         } else {
@@ -5908,9 +5968,18 @@ bool cliSetSettingByName(const char *cmdline)
                 }
                 *(int32_t *)ptr = (int32_t)v;
             } else {
-                long v = strtol(valStr, &endptr, 10);
-                if (endptr == valStr || *endptr != '\0') {
-                    return false;
+                long v = 0;
+                if ((val->type & VALUE_SCALE_MASK) != 0) {
+                    int scaled = 0;
+                    if (!cliParseScaledDirectValue(val, valStr, &scaled)) {
+                        return false;
+                    }
+                    v = scaled;
+                } else {
+                    v = strtol(valStr, &endptr, 10);
+                    if (endptr == valStr || *endptr != '\0') {
+                        return false;
+                    }
                 }
                 int min, max;
                 getMinMax(val, &min, &max);
@@ -6033,6 +6102,7 @@ bool cliSetSettingByName(const char *cmdline)
         return false;
     }
 
+    cliPostSetUpdate(val);
     return true;
 }
 
@@ -6084,6 +6154,24 @@ static void cliSt4rponyDebug(const char *cmdName, char *cmdline)
     const uint8_t profileIdx = getCurrentPidProfileIndex();
     const ladrcProfile_t *cfg = ladrcProfiles(profileIdx);
     const char *axisNames[XYZ_AXIS_COUNT] = { "ROLL", "PITCH", "YAW" };
+    const indiFeedbackMode_e fbMode = indiGetFeedbackMode();
+    const uint8_t activeDshotMotors = indiGetDshotActiveMotorCount();
+    const uint16_t fIndiDeci = (uint16_t)lrintf(indiComputeFIndiHz(cfg) * 10.0f);
+    const char *modeLabel = (fbMode == INDI_FEEDBACK_DSHOT_RPM) ? "DSHOT_RPM" :
+                            indiIsDshotStandbyNoBattery() ? "STANDBY_NO_VBAT" : "WARNING:FALLBACK_MODEL";
+    const char *modeDetail = (fbMode == INDI_FEEDBACK_DSHOT_RPM) ? "ok" :
+                             indiIsDshotStandbyNoBattery() ? "dshot_bidir_on_plug_lipo" : "no_dshot_rpm";
+    cliPrintLinef("INDI: mode=%s (%s, active_motors=%u/%u) prop=%u.%u\" auw=%u.%02ukg agility=%u.%02u auth=%u.%02u override=%u f_indi=%u.%uHz",
+        modeLabel,
+        modeDetail,
+        activeDshotMotors,
+        getMotorCount(),
+        cfg->prop_size_deci_in / 10, cfg->prop_size_deci_in % 10,
+        cfg->auw_centi_kg / 100, cfg->auw_centi_kg % 100,
+        cfg->agility_pct / 100, cfg->agility_pct % 100,
+        cfg->authority_trim_pct / 100, cfg->authority_trim_pct % 100,
+        cfg->manual_override,
+        fIndiDeci / 10, fIndiDeci % 10);
     cliPrintLinef("LADRC_PROFILE[%u]: anti_windup=%u vbat_comp=%u dist_limit=%u looptime=%uus",
         profileIdx, cfg->anti_windup, cfg->vbat_b0_comp, cfg->disturbance_limit, (unsigned)targetPidLooptime);
     for (int axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
@@ -6389,6 +6477,15 @@ RAM_CODE static void cliStatus(const char *cmdName, char *cmdline)
     cliPrintLinef("Voltage: %d.%02dV (%dS battery - %s)", v01 / 100, v01 % 100, getBatteryCellCount(), getBatteryStateString());
 
     // Other status
+#ifdef USE_LADRC
+    if (indiGetFeedbackMode() == INDI_FEEDBACK_DSHOT_RPM) {
+        cliPrintLinef("INDI feedback: DSHOT_RPM (%u/%u motors active)", indiGetDshotActiveMotorCount(), getMotorCount());
+    } else if (indiIsDshotStandbyNoBattery()) {
+        cliPrintLinef("INDI feedback: FALLBACK_MODEL standby (Bidirectional DShot ON - plug battery for eRPM telemetry)");
+    } else {
+        cliPrintLinef("INDI feedback: WARNING FALLBACK_MODEL (active DShot RPM motors: %u/%u)", indiGetDshotActiveMotorCount(), getMotorCount());
+    }
+#endif
     cliPrint("Arming disable flags:");
     armingDisableFlags_e flags = getArmingDisableFlags();
     while (flags) {
